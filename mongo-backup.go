@@ -25,7 +25,7 @@ import (
 )
 
 const (
-	ver string = "0.10"
+	ver string = "0.11"
 	lockFile string = "mongo-backup.lock"
 	dateLayout string = "2006-01-02_150405"
 )
@@ -100,7 +100,7 @@ func stopBalancer(url string, stopBalancerTimeout int) error {
 	c := session.DB("config").C("settings")
 	err = c.Update(bson.M{"_id": "balancer"}, bson.M{"$set": bson.M{"stopped": true}})
 	if err != nil {
-		return err
+		return fmt.Errorf("Cannot disable balancer, if balancer was never disabled on this cluster try enable and disable it manually: %v", err)
 	}
 
 	log.Info("Waiting for balancer unlocked")
