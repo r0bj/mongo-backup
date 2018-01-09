@@ -25,7 +25,7 @@ import (
 )
 
 const (
-	ver string = "0.11"
+	ver string = "0.12"
 	lockFile string = "mongo-backup.lock"
 	dateLayout string = "2006-01-02_150405"
 )
@@ -289,7 +289,7 @@ func disableChef(user, host string, port int) error {
 }
 
 func disableMongo(user, host string, port int) error {
-	log.Infof("%s: disabling mongo", host)
+	log.Infof("%s: disabling mongod", host)
 	if err := executeCommand(prepareSshCommands(user, host, port, []string{"sudo", "touch", "/etc/disabled/mongo"})); err != nil {
 		return err
 	}
@@ -298,7 +298,7 @@ func disableMongo(user, host string, port int) error {
 }
 
 func stopMongoDaemon(user, host string, port int) error {
-	log.Infof("%s: stopping mongo daemon", host)
+	log.Infof("%s: stopping mongod daemon", host)
 	if err := executeCommand(prepareSshCommands(user, host, port, []string{"sudo", "systemctl", "stop", "mongod.service"})); err != nil {
 		return err
 	}
@@ -307,7 +307,7 @@ func stopMongoDaemon(user, host string, port int) error {
 }
 
 func startMongoDaemon(user, host string, port int) error {
-	log.Infof("%s: starting mongo daemon", host)
+	log.Infof("%s: starting mongod daemon", host)
 	if err := executeCommand(prepareSshCommands(user, host, port, []string{"sudo", "systemctl", "start", "mongod.service"})); err != nil {
 		return err
 	}
@@ -325,7 +325,7 @@ func enableChef(user, host string, port int) error {
 }
 
 func enableMongo(user, host string, port int) error {
-	log.Infof("%s: enabling mongo", host)
+	log.Infof("%s: enabling mongod", host)
 	err := executeCommand(prepareSshCommands(user, host, port, []string{"sudo", "rm", "-f", "/etc/disabled/mongo"}))
 	if err != nil {
 		return err
@@ -347,16 +347,29 @@ func flushBuffers(user, host string, port int) error {
 func waitingChefStopped(user, host string, port, waitingChefStoppedTimeout int) error {
 	log.Infof("%s: waiting chef-client not running", host)
 
+	success := false
 	for i := 0; i < waitingChefStoppedTimeout; i++ {
-		err := executeCommand(prepareSshCommands(user, host, port, []string{"sudo", "pgrep", "chef-client"}))
-		if err != nil {
-			return nil
+		if i > 0 {
+			log.Debug("Waiting for chef-client stopped")
+			time.Sleep(time.Second * 3)
 		}
-		log.Debugf("Waiting for chef-client stopped: %d seconds", i)
-		time.Sleep(time.Second)
+		if err := executeCommand(prepareSshCommands(user, host, port, []string{"sudo", "pgrep", "chef-client"})); err == nil {
+			continue
+		}
+
+		if err := executeCommand(prepareSshCommands(user, host, port, []string{"sudo", "pgrep", "lazy_chef_run"})); err == nil {
+			continue
+		}
+
+		success = true
+		break
 	}
 
-	return errors.New("Chef-client still running after timeout")
+	if success {
+		return nil
+	} else {
+		return errors.New("Chef-client still running after timeout")
+	}
 }
 
 func disableMongoNode(nodeName, sshUser string, sshPort, waitingChefStoppedTimeout, stopMongoDaemonDelay int, result chan<- error) {
@@ -371,14 +384,14 @@ func disableMongoNode(nodeName, sshUser string, sshPort, waitingChefStoppedTimeo
 	}
 
 	if err := disableMongo(sshUser, nodeName, sshPort); err != nil {
-		result <- fmt.Errorf("%s: cannot disable mongo", nodeName)
+		result <- fmt.Errorf("%s: cannot disable mongod", nodeName)
 		return
 	}
 
 	log.Infof("%s: waiting delay %d seconds", nodeName, stopMongoDaemonDelay)
 	time.Sleep(time.Second * time.Duration(stopMongoDaemonDelay))
 	if err := stopMongoDaemon(sshUser, nodeName, sshPort); err != nil {
-		result <- fmt.Errorf("%s: cannot stop mongo daemon", nodeName)
+		result <- fmt.Errorf("%s: cannot stop mongod daemon", nodeName)
 		return
 	}
 
@@ -418,11 +431,11 @@ func enableMongoNode(nodeName, sshUser string, sshPort int) error {
 	}
 
 	if err := enableMongo(sshUser, nodeName, sshPort); err != nil {
-		return fmt.Errorf("%s: cannot enable mongo", nodeName)
+		return fmt.Errorf("%s: cannot enable mongod", nodeName)
 	}
 
 	if err := startMongoDaemon(sshUser, nodeName, sshPort); err != nil {
-		return fmt.Errorf("%s: cannot start mongo daemon", nodeName)
+		return fmt.Errorf("%s: cannot start mongod daemon", nodeName)
 	}
 
 	return nil
@@ -435,12 +448,12 @@ func enableMongoNodeConcurrent(nodeName, sshUser string, sshPort, waitingChefSto
 	}
 
 	if err := enableMongo(sshUser, nodeName, sshPort); err != nil {
-		result <- fmt.Errorf("%s: cannot enable mongo", nodeName)
+		result <- fmt.Errorf("%s: cannot enable mongod", nodeName)
 		return
 	}
 
 	if err := startMongoDaemon(sshUser, nodeName, sshPort); err != nil {
-		result <- fmt.Errorf("%s: cannot start mongo daemon", nodeName)
+		result <- fmt.Errorf("%s: cannot start mongod daemon", nodeName)
 		return
 	}
 
