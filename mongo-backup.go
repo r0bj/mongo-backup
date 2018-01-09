@@ -25,7 +25,7 @@ import (
 )
 
 const (
-	ver string = "0.16"
+	ver string = "0.17"
 	lockFile string = "mongo-backup.lock"
 	dateLayout string = "2006-01-02_150405"
 )
@@ -735,7 +735,7 @@ func main() {
 		log.SetLevel(log.DebugLevel)
 	}
 
-	log.Info("Starting...")
+	log.Infof("Starting, version %s", ver)
 
 	lock, err := lockfile.New(filepath.Join(os.TempDir(), lockFile))
 	if err != nil {
