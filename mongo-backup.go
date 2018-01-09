@@ -25,7 +25,7 @@ import (
 )
 
 const (
-	ver string = "0.14"
+	ver string = "0.15"
 	lockFile string = "mongo-backup.lock"
 	dateLayout string = "2006-01-02_150405"
 )
@@ -50,21 +50,25 @@ var (
 	slackIconEmoji = kingpin.Flag("slack-icon-emoji", "slack icon-emoji field").Default(":mongo-backup:").String()
 )
 
+// Command : containts exec command data
 type Command struct {
 	cmd string
 	args []string
 }
 
+// Lock : containts Lock data
 type Lock struct {
 	ID bson.ObjectId `bson:"_id,omitempty"`
 	State int
 }
 
+// Msg : containts Msg data
 type Msg struct {
 	node string
 	err error
 }
 
+// Job : containts Job data
 type Job struct {
 	clusterName string
 	shardName string
@@ -76,6 +80,7 @@ type Job struct {
 	dateString string
 }
 
+// Payload : containts slack Payload data
 type Payload struct {
 	Username string `json:"username"`
 	Channel string `json:"channel"`
@@ -83,6 +88,7 @@ type Payload struct {
 	Attachments []Attachment `json:"attachments"`
 }
 
+// Attachment : containts slack Attachment data
 type Attachment struct {
 	Color string `json:"color"`
 	Text string `json:"text"`
@@ -122,11 +128,11 @@ func stopBalancer(url string, stopBalancerTimeout int) error {
 		time.Sleep(time.Second)
 	}
 
-	if unlocked {
-		return nil
-	} else {
+	if !unlocked {
 		return errors.New("Balancer is still locked after timeout")
 	}
+
+	return nil
 }
 
 func startBalancer(url string) error {
@@ -192,7 +198,7 @@ func getShards(url string) (map[string][]map[string]string, error) {
 		return map[string][]map[string]string{}, err
 	}
 
-	for k, _ := range data {
+	for k := range data {
 		shardStr := strings.Split(k, "/")
 		shardName := shardStr[0]
 
@@ -260,7 +266,7 @@ func getSecondaryNodes(url string) (map[string]string, error) {
 	return secondaryNodes, nil
 }
 
-func prepareSshCommands(user, host string, port int, remoteCmd []string) Command {
+func prepareSSHCommands(user, host string, port int, remoteCmd []string) Command {
 	var command Command
 	command.cmd = "ssh"
 	command.args = []string{
@@ -281,67 +287,44 @@ func prepareSshCommands(user, host string, port int, remoteCmd []string) Command
 
 func disableChef(user, host string, port int) error {
 	log.Infof("%s: disabling chef-client", host)
-	if err := executeCommand(prepareSshCommands(user, host, port, []string{"sudo", "touch", "/etc/disabled/chef"})); err != nil {
-		return err
-	}
 
-	return nil
+	return executeCommand(prepareSSHCommands(user, host, port, []string{"sudo", "touch", "/etc/disabled/chef"}))
 }
 
 func disableMongo(user, host string, port int) error {
 	log.Infof("%s: disabling mongod", host)
-	if err := executeCommand(prepareSshCommands(user, host, port, []string{"sudo", "touch", "/etc/disabled/mongo"})); err != nil {
-		return err
-	}
 
-	return nil
+	return executeCommand(prepareSSHCommands(user, host, port, []string{"sudo", "touch", "/etc/disabled/mongo"}))
 }
 
 func stopMongoDaemon(user, host string, port int) error {
 	log.Infof("%s: stopping mongod daemon", host)
-	if err := executeCommand(prepareSshCommands(user, host, port, []string{"sudo", "systemctl", "stop", "mongod.service"})); err != nil {
-		return err
-	}
 
-	return nil
+	return executeCommand(prepareSSHCommands(user, host, port, []string{"sudo", "systemctl", "stop", "mongod.service"}))
 }
 
 func startMongoDaemon(user, host string, port int) error {
 	log.Infof("%s: starting mongod daemon", host)
-	if err := executeCommand(prepareSshCommands(user, host, port, []string{"sudo", "systemctl", "start", "mongod.service"})); err != nil {
-		return err
-	}
 
-	return nil
+	return executeCommand(prepareSSHCommands(user, host, port, []string{"sudo", "systemctl", "start", "mongod.service"}))
 }
 
 func enableChef(user, host string, port int) error {
 	log.Infof("%s: enabling chef-client", host)
-	if err := executeCommand(prepareSshCommands(user, host, port, []string{"sudo", "rm", "-f", "/etc/disabled/chef"})); err != nil {
-		return err
-	}
 
-	return nil
+	return executeCommand(prepareSSHCommands(user, host, port, []string{"sudo", "rm", "-f", "/etc/disabled/chef"}))
 }
 
 func enableMongo(user, host string, port int) error {
 	log.Infof("%s: enabling mongod", host)
-	err := executeCommand(prepareSshCommands(user, host, port, []string{"sudo", "rm", "-f", "/etc/disabled/mongo"}))
-	if err != nil {
-		return err
-	}
 
-	return nil
+	return executeCommand(prepareSSHCommands(user, host, port, []string{"sudo", "rm", "-f", "/etc/disabled/mongo"}))
 }
 
 func flushBuffers(user, host string, port int) error {
 	log.Infof("%s: flushing buffers", host)
-	err := executeCommand(prepareSshCommands(user, host, port, []string{"sync"}))
-	if err != nil {
-		return err
-	}
 
-	return nil
+	return executeCommand(prepareSSHCommands(user, host, port, []string{"sync"}))
 }
 
 func waitingChefStopped(user, host string, port, waitingChefStoppedTimeout int) error {
@@ -353,11 +336,11 @@ func waitingChefStopped(user, host string, port, waitingChefStoppedTimeout int) 
 			log.Debug("Waiting for chef-client stopped")
 			time.Sleep(time.Second * 3)
 		}
-		if err := executeCommand(prepareSshCommands(user, host, port, []string{"sudo", "pgrep", "chef-client"})); err == nil {
+		if err := executeCommand(prepareSSHCommands(user, host, port, []string{"sudo", "pgrep", "chef-client"})); err == nil {
 			continue
 		}
 
-		if err := executeCommand(prepareSshCommands(user, host, port, []string{"sudo", "pgrep", "lazy_chef_run"})); err == nil {
+		if err := executeCommand(prepareSSHCommands(user, host, port, []string{"sudo", "pgrep", "lazy_chef_run"})); err == nil {
 			continue
 		}
 
@@ -365,11 +348,11 @@ func waitingChefStopped(user, host string, port, waitingChefStoppedTimeout int) 
 		break
 	}
 
-	if success {
-		return nil
-	} else {
+	if !success {
 		return errors.New("Chef-client still running after timeout")
 	}
+
+	return nil
 }
 
 func disableMongoNode(nodeName, sshUser string, sshPort, waitingChefStoppedTimeout, stopMongoDaemonDelay int, result chan<- error) {
@@ -687,7 +670,7 @@ func executeCommand(command Command) error {
 	return nil
 }
 
-func sendSlackMsg(webhookUrl, channel, cluster, username, color, iconEmoji string, timeout int) error {
+func sendSlackMsg(webhookURL, channel, cluster, username, color, iconEmoji string, timeout int) error {
 	payload := Payload{
 		Username: username,
 		Channel: channel,
@@ -707,7 +690,7 @@ func sendSlackMsg(webhookUrl, channel, cluster, username, color, iconEmoji strin
 	}
 
 	result := make(chan error)
-	go httpPost(webhookUrl, string(json), result)
+	go httpPost(webhookURL, string(json), result)
 
 	select {
 	case err := <-result:
