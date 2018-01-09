@@ -25,14 +25,14 @@ import (
 )
 
 const (
-	ver string = "0.12"
+	ver string = "0.14"
 	lockFile string = "mongo-backup.lock"
 	dateLayout string = "2006-01-02_150405"
 )
 
 var (
 	stopBalancerTimeout = kingpin.Flag("timeout", "timeout for stopping mongo balancer in seconds").Default("1800").Short('t').Int()
-	waitingChefStoppedTimeout = kingpin.Flag("chef-timeout", "waiting for chef stopped timoue in seconds").Default("300").Int()
+	waitingChefStoppedTimeout = kingpin.Flag("chef-timeout", "waiting for chef stopped timoue in seconds").Default("900").Int()
 	stopMongoDaemonDelay = kingpin.Flag("stop-delay", "delay after chef disabled to stop MongoDB daemon on seconds").Default("240").Int()
 	mongosURL = kingpin.Flag("url", "mongos URL").Default("127.0.0.1:27017").Short('u').String()
 	sshUser = kingpin.Flag("ssh-user", "ssh user").Default("backup_mongo").String()
@@ -100,7 +100,7 @@ func stopBalancer(url string, stopBalancerTimeout int) error {
 	c := session.DB("config").C("settings")
 	err = c.Update(bson.M{"_id": "balancer"}, bson.M{"$set": bson.M{"stopped": true}})
 	if err != nil {
-		return fmt.Errorf("Cannot disable balancer, if balancer was never disabled on this cluster try enable and disable it manually: %v", err)
+		return fmt.Errorf("Cannot disable balancer, if balancer was never disabled on this cluster try enabling and disabling it manually, sh.stopBalancer(), sh.startBalancer(): %v", err)
 	}
 
 	log.Info("Waiting for balancer unlocked")
@@ -425,23 +425,7 @@ func disableMongoNodes(shards map[string]string, sshUser string, sshPort, waitin
 	return nil
 }
 
-func enableMongoNode(nodeName, sshUser string, sshPort int) error {
-	if err := enableChef(sshUser, nodeName, sshPort); err != nil {
-		return fmt.Errorf("%s: cannot enable chef-client", nodeName)
-	}
-
-	if err := enableMongo(sshUser, nodeName, sshPort); err != nil {
-		return fmt.Errorf("%s: cannot enable mongod", nodeName)
-	}
-
-	if err := startMongoDaemon(sshUser, nodeName, sshPort); err != nil {
-		return fmt.Errorf("%s: cannot start mongod daemon", nodeName)
-	}
-
-	return nil
-}
-
-func enableMongoNodeConcurrent(nodeName, sshUser string, sshPort, waitingChefStoppedTimeout int, result chan<- error) {
+func enableMongoNode(nodeName, sshUser string, sshPort int, result chan<- error) {
 	if err := enableChef(sshUser, nodeName, sshPort); err != nil {
 		result <- fmt.Errorf("%s: cannot enable chef-client", nodeName)
 		return
@@ -460,11 +444,11 @@ func enableMongoNodeConcurrent(nodeName, sshUser string, sshPort, waitingChefSto
 	result <- nil
 }
 
-func enableMongoNodesConcurrent(shards map[string]string, sshUser string, sshPort, waitingChefStoppedTimeout int) error {
+func enableMongoNodes(shards map[string]string, sshUser string, sshPort int) error {
 	result := make(chan error, len(shards))
 
 	for _, nodeName := range shards {
-		go enableMongoNodeConcurrent(nodeName, sshUser, sshPort, waitingChefStoppedTimeout, result)
+		go enableMongoNode(nodeName, sshUser, sshPort, result)
 	}
 
 	failed := false
@@ -481,8 +465,8 @@ func enableMongoNodesConcurrent(shards map[string]string, sshUser string, sshPor
 	return nil
 }
 
-func clenaup(url string, shards map[string]string, sshUser string, sshPort, waitingChefStoppedTimeout int) {
-	if err := enableMongoNodesConcurrent(shards, sshUser, sshPort, waitingChefStoppedTimeout); err != nil {
+func clenaup(url string, shards map[string]string, sshUser string, sshPort int) {
+	if err := enableMongoNodes(shards, sshUser, sshPort); err != nil {
 		log.Error(err)
 	}
 
@@ -544,7 +528,7 @@ func processNodes(mongoClusterName, url string, stopBalancerTimeout int, sshUser
 		<-sigchan
 		log.Error("Program killed!")
 
-		clenaup(url, shards, sshUser, sshPort, waitingChefStoppedTimeout)
+		clenaup(url, shards, sshUser, sshPort)
 
 		lock.Unlock()
 		os.Exit(1)
@@ -635,19 +619,21 @@ func rsyncWorker(jobs <-chan Job, results chan<- Msg) {
 		}
 
 		if msg.err == nil {
-			log.Infof("Performing rsync backup from %s", j.nodeName)
+			log.Infof("Shard %s, performing rsync backup from %s", j.shardName, j.nodeName)
 			if err := executeCommand(prepareRsyncCommands(j.clusterName, j.shardName, j.sshUser, j.sshPort, j.nodeName, j.srcPath, dstPath)); err != nil {
 				msg.err = err
 			}
 		}
 
 		if msg.err == nil {
-			log.Infof("Rsync from %s completed successfully", j.nodeName)
+			log.Infof("Shard %s: rsync from %s completed successfully", j.shardName, j.nodeName)
 		} else {
-			log.Errorf("Rsync failed from node %s: %v", msg.node, msg.err)
+			log.Errorf("Shard %s: rsync failed from node %s: %v", j.shardName, msg.node, msg.err)
 		}
 
-		if err := enableMongoNode(j.nodeName, j.sshUser, j.sshPort); err != nil {
+		result := make(chan error)
+		go enableMongoNode(j.nodeName, j.sshUser, j.sshPort, result)
+		if err := <-result; err != nil {
 			log.Errorf("%s: cannot enable mongo node: %v", j.nodeName, err)
 		}
 
@@ -770,7 +756,7 @@ func main() {
 
 	lock, err := lockfile.New(filepath.Join(os.TempDir(), lockFile))
 	if err != nil {
-		log.Fatalf("Cannot init lock. reason: %v", err)
+		log.Fatalf("Cannot initialize lock. reason: %v", err)
 	}
 
 	err = lock.TryLock()
@@ -794,7 +780,7 @@ func main() {
 		lock,
 		*dryRun,
 	); err != nil {
-		log.Error(err)
+		log.Errorf("Program finished with error: %v", err)
 		sendSlackMsg(*slackURL, *slackChannel, *mongoClusterName, *slackUsername, "danger", *slackIconEmoji, 5)
 	}
 }
