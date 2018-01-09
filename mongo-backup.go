@@ -25,7 +25,7 @@ import (
 )
 
 const (
-	ver string = "0.15"
+	ver string = "0.16"
 	lockFile string = "mongo-backup.lock"
 	dateLayout string = "2006-01-02_150405"
 )
@@ -700,7 +700,7 @@ func sendSlackMsg(webhookURL, channel, cluster, username, color, iconEmoji strin
 	}
 }
 
-func httpPost(url, data string, result chan error) {
+func httpPost(url, data string, result chan<- error) {
 	request := gorequest.New()
 	resp, _, errs := request.Post(url).
 		Send(data).
