@@ -25,7 +25,7 @@ import (
 )
 
 const (
-	ver string = "0.17"
+	ver string = "0.18"
 	lockFile string = "mongo-backup.lock"
 	dateLayout string = "2006-01-02_150405"
 )
@@ -602,7 +602,7 @@ func rsyncWorker(jobs <-chan Job, results chan<- Msg) {
 		}
 
 		if msg.err == nil {
-			log.Infof("Shard %s, performing rsync backup from %s", j.shardName, j.nodeName)
+			log.Infof("Shard %s: performing rsync backup from %s", j.shardName, j.nodeName)
 			if err := executeCommand(prepareRsyncCommands(j.clusterName, j.shardName, j.sshUser, j.sshPort, j.nodeName, j.srcPath, dstPath)); err != nil {
 				msg.err = err
 			}
