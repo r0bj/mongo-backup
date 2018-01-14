@@ -25,8 +25,7 @@ import (
 )
 
 const (
-	ver string = "0.18"
-	lockFile string = "mongo-backup.lock"
+	ver string = "0.22"
 	dateLayout string = "2006-01-02_150405"
 )
 
@@ -266,7 +265,7 @@ func getSecondaryNodes(url string) (map[string]string, error) {
 	return secondaryNodes, nil
 }
 
-func prepareSSHCommands(user, host string, port int, remoteCmd []string) Command {
+func prepareSSHCommands(nodeName, sshUser string, sshPort int, remoteCmd []string) Command {
 	var command Command
 	command.cmd = "ssh"
 	command.args = []string{
@@ -275,72 +274,88 @@ func prepareSSHCommands(user, host string, port int, remoteCmd []string) Command
 		"-o",
 		"PasswordAuthentication=no",
 		"-p",
-		strconv.Itoa(port),
+		strconv.Itoa(sshPort),
 		"-l",
-		user,
-		host,
+		sshUser,
+		nodeName,
 	}
 	command.args = append(command.args, remoteCmd...)
 
 	return command
 }
 
-func disableChef(user, host string, port int) error {
-	log.Infof("%s: disabling chef-client", host)
+func disableChef(nodeName, sshUser string, sshPort, waitingChefStoppedTimeout int, result chan<- error) {
+	log.Infof("%s: disabling chef-client (/etc/disabled/chef)", nodeName)
 
-	return executeCommand(prepareSSHCommands(user, host, port, []string{"sudo", "touch", "/etc/disabled/chef"}))
+	if err := executeCommand(prepareSSHCommands(nodeName, sshUser, sshPort, []string{"sudo", "touch", "/etc/disabled/chef"})); err == nil {
+		if err := waitingChefStopped(nodeName, sshUser, sshPort, waitingChefStoppedTimeout); err != nil {
+			result <- err
+			return
+		}
+	} else {
+		result <- err
+		return
+	}
+	result <- nil
 }
 
-func disableMongo(user, host string, port int) error {
-	log.Infof("%s: disabling mongod", host)
+func disableMongo(nodeName, sshUser string, sshPort int, result chan<- error) {
+	log.Infof("%s: disabling mongod (/etc/disabled/mongo)", nodeName)
 
-	return executeCommand(prepareSSHCommands(user, host, port, []string{"sudo", "touch", "/etc/disabled/mongo"}))
+	result <- executeCommand(prepareSSHCommands(nodeName, sshUser, sshPort, []string{"sudo", "touch", "/etc/disabled/mongo"}))
 }
 
-func stopMongoDaemon(user, host string, port int) error {
-	log.Infof("%s: stopping mongod daemon", host)
+func stopMongoDaemon(nodeName, sshUser string, sshPort int, result chan<- error) {
+	log.Infof("%s: stopping mongod daemon", nodeName)
 
-	return executeCommand(prepareSSHCommands(user, host, port, []string{"sudo", "systemctl", "stop", "mongod.service"}))
+	if err := executeCommand(prepareSSHCommands(nodeName, sshUser, sshPort, []string{"sudo", "systemctl", "stop", "mongod.service"})); err != nil {
+		result <- err
+		return
+	}
+
+	log.Infof("%s: mongod daemon stopped", nodeName)
+	flushBuffers(nodeName, sshUser, sshPort)
+	result <- nil
 }
 
-func startMongoDaemon(user, host string, port int) error {
-	log.Infof("%s: starting mongod daemon", host)
+func startMongoDaemon(nodeName, sshUser string, sshPort int) error {
+	log.Infof("%s: starting mongod daemon", nodeName)
 
-	return executeCommand(prepareSSHCommands(user, host, port, []string{"sudo", "systemctl", "start", "mongod.service"}))
+	return executeCommand(prepareSSHCommands(nodeName, sshUser, sshPort, []string{"sudo", "systemctl", "start", "mongod.service"}))
 }
 
-func enableChef(user, host string, port int) error {
-	log.Infof("%s: enabling chef-client", host)
+func enableChef(nodeName, sshUser string, sshPort int) error {
+	log.Infof("%s: enabling chef-client (/etc/disabled/chef)", nodeName)
 
-	return executeCommand(prepareSSHCommands(user, host, port, []string{"sudo", "rm", "-f", "/etc/disabled/chef"}))
+	return executeCommand(prepareSSHCommands(nodeName, sshUser, sshPort, []string{"sudo", "rm", "-f", "/etc/disabled/chef"}))
 }
 
-func enableMongo(user, host string, port int) error {
-	log.Infof("%s: enabling mongod", host)
+func enableMongo(nodeName, sshUser string, sshPort int) error {
+	log.Infof("%s: enabling mongod (/etc/disabled/mongo)", nodeName)
 
-	return executeCommand(prepareSSHCommands(user, host, port, []string{"sudo", "rm", "-f", "/etc/disabled/mongo"}))
+	return executeCommand(prepareSSHCommands(nodeName, sshUser, sshPort, []string{"sudo", "rm", "-f", "/etc/disabled/mongo"}))
 }
 
-func flushBuffers(user, host string, port int) error {
-	log.Infof("%s: flushing buffers", host)
+func flushBuffers(nodeName, sshUser string, sshPort int) error {
+	log.Infof("%s: flushing buffers", nodeName)
 
-	return executeCommand(prepareSSHCommands(user, host, port, []string{"sync"}))
+	return executeCommand(prepareSSHCommands(nodeName, sshUser, sshPort, []string{"sync"}))
 }
 
-func waitingChefStopped(user, host string, port, waitingChefStoppedTimeout int) error {
-	log.Infof("%s: waiting chef-client not running", host)
+func waitingChefStopped(nodeName, sshUser string, port, waitingChefStoppedTimeout int) error {
+	log.Infof("%s: waiting chef-client not running", nodeName)
 
 	success := false
 	for i := 0; i < waitingChefStoppedTimeout; i++ {
 		if i > 0 {
-			log.Debug("Waiting for chef-client stopped")
-			time.Sleep(time.Second * 3)
+			log.Debugf("%s: waiting for chef-client stopped", nodeName)
+			time.Sleep(time.Second * 1)
 		}
-		if err := executeCommand(prepareSSHCommands(user, host, port, []string{"sudo", "pgrep", "chef-client"})); err == nil {
+		if err := executeCommand(prepareSSHCommands(nodeName, sshUser, port, []string{"sudo", "pgrep", "chef-client"})); err == nil {
 			continue
 		}
 
-		if err := executeCommand(prepareSSHCommands(user, host, port, []string{"sudo", "pgrep", "lazy_chef_run"})); err == nil {
+		if err := executeCommand(prepareSSHCommands(nodeName, sshUser, port, []string{"sudo", "pgrep", "lazy_chef_run"})); err == nil {
 			continue
 		}
 
@@ -349,107 +364,128 @@ func waitingChefStopped(user, host string, port, waitingChefStoppedTimeout int) 
 	}
 
 	if !success {
-		return errors.New("Chef-client still running after timeout")
+		return fmt.Errorf("%s: waiting chef-client stopped timeout", nodeName)
 	}
 
 	return nil
 }
 
-func disableMongoNode(nodeName, sshUser string, sshPort, waitingChefStoppedTimeout, stopMongoDaemonDelay int, result chan<- error) {
-	if err := disableChef(sshUser, nodeName, sshPort); err != nil {
-		result <- fmt.Errorf("%s: cannot disable chef-client", nodeName)
-		return
-	}
-
-	if err := waitingChefStopped(sshUser, nodeName, sshPort, waitingChefStoppedTimeout); err != nil {
-		result <- fmt.Errorf("%s: waiting chef-client stopped timeout", nodeName)
-		return 
-	}
-
-	if err := disableMongo(sshUser, nodeName, sshPort); err != nil {
-		result <- fmt.Errorf("%s: cannot disable mongod", nodeName)
-		return
-	}
-
-	log.Infof("%s: waiting delay %d seconds", nodeName, stopMongoDaemonDelay)
-	time.Sleep(time.Second * time.Duration(stopMongoDaemonDelay))
-	if err := stopMongoDaemon(sshUser, nodeName, sshPort); err != nil {
-		result <- fmt.Errorf("%s: cannot stop mongod daemon", nodeName)
-		return
-	}
-
-	if err := flushBuffers(sshUser, nodeName, sshPort); err != nil {
-		result <- fmt.Errorf("%s: cannot flush buffers", nodeName)
-		time.Sleep(time.Second * 10)
-		return
-	}
-
-	result <- nil
-}
-
-func disableMongoNodes(shards map[string]string, sshUser string, sshPort, waitingChefStoppedTimeout, stopMongoDaemonDelay int) error {
-	result := make(chan error, len(shards))
-
-	for _, nodeName := range shards {
-		go disableMongoNode(nodeName, sshUser, sshPort, waitingChefStoppedTimeout, stopMongoDaemonDelay, result)
-	}
-
+func drainNodes(shards map[string]string, sshUser string, sshPort, waitingChefStoppedTimeout, stopMongoDaemonDelay int) error {
 	failed := false
-	for i := 0; i < len(shards); i++ {
-		if err := <-result; err != nil {
+	if err := disableChefOnNodes(shards, sshUser, sshPort, waitingChefStoppedTimeout); err != nil {
+		log.Error(err)
+		failed = true
+	}
+
+	if !failed {
+		if err := disableMongoOnNodes(shards, sshUser, sshPort); err != nil {
+			log.Error(err)
+			failed = true
+		}
+	}
+
+	if !failed {
+		log.Infof("Waiting delay %d seconds", stopMongoDaemonDelay)
+		time.Sleep(time.Second * time.Duration(stopMongoDaemonDelay))
+
+		if err := stopMongoDaemonOnNodes(shards, sshUser, sshPort); err != nil {
 			log.Error(err)
 			failed = true
 		}
 	}
 
 	if failed {
-		return errors.New("Disabling MongoDB failed on one or more nodes")
+		return errors.New("Draining failed on one or more nodes")
 	}
 	return nil
 }
 
-func enableMongoNode(nodeName, sshUser string, sshPort int, result chan<- error) {
-	if err := enableChef(sshUser, nodeName, sshPort); err != nil {
-		result <- fmt.Errorf("%s: cannot enable chef-client", nodeName)
-		return
+func disableChefOnNodes(shards map[string]string, sshUser string, sshPort, waitingChefStoppedTimeout int) error {
+	result := make(chan error, len(shards))
+
+	for _, nodeName := range shards {
+		go disableChef(nodeName, sshUser, sshPort, waitingChefStoppedTimeout, result)
 	}
 
-	if err := enableMongo(sshUser, nodeName, sshPort); err != nil {
-		result <- fmt.Errorf("%s: cannot enable mongod", nodeName)
-		return
+	if !allResultsSuccess(shards, result) {
+		return errors.New("Disabling chef failed on one or more nodes")
+	}
+	return nil
+}
+
+func disableMongoOnNodes(shards map[string]string, sshUser string, sshPort int) error {
+	result := make(chan error, len(shards))
+
+	for _, nodeName := range shards {
+		go disableMongo(nodeName, sshUser, sshPort, result)
 	}
 
-	if err := startMongoDaemon(sshUser, nodeName, sshPort); err != nil {
-		result <- fmt.Errorf("%s: cannot start mongod daemon", nodeName)
-		return
+	if !allResultsSuccess(shards, result) {
+		return errors.New("Disabling mongod failed on one or more nodes")
+	}
+	return nil
+}
+
+func stopMongoDaemonOnNodes(shards map[string]string, sshUser string, sshPort int) error {
+	result := make(chan error, len(shards))
+
+	for _, nodeName := range shards {
+		go stopMongoDaemon(nodeName, sshUser, sshPort, result)
+	}
+
+	if !allResultsSuccess(shards, result) {
+		return errors.New("Stopping mongod daemon failed on one or more nodes")
+	}
+	return nil
+}
+
+func activateNode(nodeName, sshUser string, sshPort int, result chan<- error) {
+	var errors []string
+	if err := enableChef(nodeName, sshUser, sshPort); err != nil {
+		errors = append(errors, fmt.Sprintf("%s: cannot enable chef-client", nodeName))
+	}
+
+	if err := enableMongo(nodeName, sshUser, sshPort); err != nil {
+		errors = append(errors, fmt.Sprintf("%s: cannot enable mongod", nodeName))
+	}
+
+	if err := startMongoDaemon(nodeName, sshUser, sshPort); err != nil {
+		errors = append(errors, fmt.Sprintf("%s: cannot start mongod daemon", nodeName))
+	}
+
+	if len(errors) > 0 {
+		result <- fmt.Errorf("%s", strings.Join(errors, "; "))
 	}
 
 	result <- nil
 }
 
-func enableMongoNodes(shards map[string]string, sshUser string, sshPort int) error {
+func activateNodes(shards map[string]string, sshUser string, sshPort int) error {
 	result := make(chan error, len(shards))
 
 	for _, nodeName := range shards {
-		go enableMongoNode(nodeName, sshUser, sshPort, result)
+		go activateNode(nodeName, sshUser, sshPort, result)
 	}
 
-	failed := false
+	if !allResultsSuccess(shards, result) {
+		return errors.New("One or more nodes activate failed")
+	}
+	return nil
+}
+
+func allResultsSuccess(shards map[string]string, result <-chan error) bool {
+	success := true
 	for i := 0; i < len(shards); i++ {
 		if err := <-result; err != nil {
 			log.Error(err)
-			failed = true
+			success = false
 		}
 	}
-
-	if failed {
-		return errors.New("Enabling MongoDB failed on one or more nodes")
-	}
-	return nil
+	return success
 }
 
 func clenaup(url string, shards map[string]string, sshUser string, sshPort int) {
-	if err := enableMongoNodes(shards, sshUser, sshPort); err != nil {
+	if err := activateNodes(shards, sshUser, sshPort); err != nil {
 		log.Error(err)
 	}
 
@@ -522,7 +558,7 @@ func processNodes(mongoClusterName, url string, stopBalancerTimeout int, sshUser
 	}
 
 	var processErr error
-	if err := disableMongoNodes(shards, sshUser, sshPort, waitingChefStoppedTimeout, stopMongoDaemonDelay); err == nil {
+	if err := drainNodes(shards, sshUser, sshPort, waitingChefStoppedTimeout, stopMongoDaemonDelay); err == nil {
 		if err := rsyncBackups(shards, mongoClusterName, sshUser, sshPort, mongoDataDir, dstRootPath, dateString, rsyncThreads); err != nil {
 			log.Error(err)
 			processErr = err
@@ -530,6 +566,9 @@ func processNodes(mongoClusterName, url string, stopBalancerTimeout int, sshUser
 	} else {
 		log.Error(err)
 		processErr = err
+		if err := activateNodes(shards, sshUser, sshPort); err != nil {
+			log.Error(err)
+		}
 	}
 
 	if err := startBalancer(url); err != nil {
@@ -615,7 +654,7 @@ func rsyncWorker(jobs <-chan Job, results chan<- Msg) {
 		}
 
 		result := make(chan error)
-		go enableMongoNode(j.nodeName, j.sshUser, j.sshPort, result)
+		go activateNode(j.nodeName, j.sshUser, j.sshPort, result)
 		if err := <-result; err != nil {
 			log.Errorf("%s: cannot enable mongo node: %v", j.nodeName, err)
 		}
@@ -737,6 +776,7 @@ func main() {
 
 	log.Infof("Starting, version %s", ver)
 
+	lockFile := "mongo-backup_" + *mongoClusterName + ".lock"
 	lock, err := lockfile.New(filepath.Join(os.TempDir(), lockFile))
 	if err != nil {
 		log.Fatalf("Cannot initialize lock. reason: %v", err)
@@ -762,7 +802,9 @@ func main() {
 		*rsyncThreads,
 		lock,
 		*dryRun,
-	); err != nil {
+	); err == nil {
+		log.Info("Program finished successfully")
+	} else {
 		log.Errorf("Program finished with error: %v", err)
 		sendSlackMsg(*slackURL, *slackChannel, *mongoClusterName, *slackUsername, "danger", *slackIconEmoji, 5)
 	}
