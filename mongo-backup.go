@@ -25,14 +25,14 @@ import (
 )
 
 const (
-	ver string = "0.22"
+	ver string = "0.23"
 	dateLayout string = "2006-01-02_150405"
 )
 
 var (
 	stopBalancerTimeout = kingpin.Flag("timeout", "timeout for stopping mongo balancer in seconds").Default("1800").Short('t').Int()
-	waitingChefStoppedTimeout = kingpin.Flag("chef-timeout", "waiting for chef stopped timoue in seconds").Default("900").Int()
-	stopMongoDaemonDelay = kingpin.Flag("stop-delay", "delay after chef disabled to stop MongoDB daemon on seconds").Default("240").Int()
+	waitingChefStoppedTimeout = kingpin.Flag("chef-timeout", "waiting for chef stopped timeout in seconds").Default("900").Int()
+	stopMongoDaemonDelay = kingpin.Flag("stop-delay", "delay after chef disabled to stop MongoDB daemon in seconds").Default("240").Int()
 	mongosURL = kingpin.Flag("url", "mongos URL").Default("127.0.0.1:27017").Short('u').String()
 	sshUser = kingpin.Flag("ssh-user", "ssh user").Default("backup_mongo").String()
 	sshPort = kingpin.Flag("ssh-port", "ssh port").Default("22").Short('p').Int()
@@ -40,8 +40,7 @@ var (
 	mongoDataDir = kingpin.Flag("data-dir", "MongoDB data directory").Default("/var/lib/mongo/").String()
 	dstRootPath = kingpin.Flag("dst-root-path", "destination root path").Default("/data/backup_mongo/files").String()
 	retentionItems = kingpin.Flag("retention-items", "number of retention items to keep").Default("5").Int()
-	verbose = kingpin.Flag("verbose", "verbose").Short('v').Bool()
-	dryRun = kingpin.Flag("dry-run", "dry run").Short('n').Bool()
+	verbose = kingpin.Flag("verbose", "verbose mode").Short('v').Bool()
 	rsyncThreads = kingpin.Flag("rsync-threads", "number of concurrent rsync threads").Default("3").Int()
 	slackURL = kingpin.Flag("slack-url", "slack URL").Default("http://127.0.0.1").String()
 	slackChannel = kingpin.Flag("slack-channel", "slack channel to send messages").Default("#it-automatic-logs").String()
@@ -337,7 +336,7 @@ func enableMongo(nodeName, sshUser string, sshPort int) error {
 }
 
 func flushBuffers(nodeName, sshUser string, sshPort int) error {
-	log.Infof("%s: flushing buffers", nodeName)
+	log.Infof("%s: flushing disk buffers", nodeName)
 
 	return executeCommand(prepareSSHCommands(nodeName, sshUser, sshPort, []string{"sync"}))
 }
@@ -531,7 +530,7 @@ func retentionDataCleanup(rootPath string, retentionItems int) error {
 	return nil
 }
 
-func processNodes(mongoClusterName, url string, stopBalancerTimeout int, sshUser string, sshPort, waitingChefStoppedTimeout int, mongoDataDir, dstRootPath string, retentionItems, stopMongoDaemonDelay, rsyncThreads int, lock lockfile.Lockfile, dryRun bool) error {
+func processNodes(mongoClusterName, url string, stopBalancerTimeout int, sshUser string, sshPort, waitingChefStoppedTimeout int, mongoDataDir, dstRootPath string, retentionItems, stopMongoDaemonDelay, rsyncThreads int, lock lockfile.Lockfile) error {
 	shards, err := getSecondaryNodes(url)
 	if err != nil {
 		return err
@@ -801,7 +800,6 @@ func main() {
 		*stopMongoDaemonDelay,
 		*rsyncThreads,
 		lock,
-		*dryRun,
 	); err == nil {
 		log.Info("Program finished successfully")
 	} else {
