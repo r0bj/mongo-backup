@@ -25,7 +25,7 @@ import (
 )
 
 const (
-	ver string = "0.23"
+	ver string = "0.24"
 	dateLayout string = "2006-01-02_150405"
 )
 
@@ -454,6 +454,7 @@ func activateNode(nodeName, sshUser string, sshPort int, result chan<- error) {
 
 	if len(errors) > 0 {
 		result <- fmt.Errorf("%s", strings.Join(errors, "; "))
+		return
 	}
 
 	result <- nil
@@ -755,6 +756,7 @@ func httpPost(url, data string, result chan<- error) {
 
 	if resp.StatusCode != 200 {
 		result <- fmt.Errorf("HTTP response code: %s", resp.Status)
+		return
 	}
 	result <- nil
 }
