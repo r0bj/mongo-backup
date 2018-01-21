@@ -25,7 +25,7 @@ import (
 )
 
 const (
-	ver string = "0.24"
+	ver string = "0.25"
 	dateLayout string = "2006-01-02_150405"
 )
 
@@ -41,7 +41,7 @@ var (
 	dstRootPath = kingpin.Flag("dst-root-path", "destination root path").Default("/data/backup_mongo/files").String()
 	retentionItems = kingpin.Flag("retention-items", "number of retention items to keep").Default("5").Int()
 	verbose = kingpin.Flag("verbose", "verbose mode").Short('v').Bool()
-	rsyncThreads = kingpin.Flag("rsync-threads", "number of concurrent rsync threads").Default("3").Int()
+	rsyncThreads = kingpin.Flag("rsync-threads", "number of concurrent rsync threads, default auto refers to number of mongo shards").Default("auto").String()
 	slackURL = kingpin.Flag("slack-url", "slack URL").Default("http://127.0.0.1").String()
 	slackChannel = kingpin.Flag("slack-channel", "slack channel to send messages").Default("#it-automatic-logs").String()
 	slackUsername = kingpin.Flag("slack-username", "slack username field").Default("mongo-backup").String()
@@ -531,10 +531,20 @@ func retentionDataCleanup(rootPath string, retentionItems int) error {
 	return nil
 }
 
-func processNodes(mongoClusterName, url string, stopBalancerTimeout int, sshUser string, sshPort, waitingChefStoppedTimeout int, mongoDataDir, dstRootPath string, retentionItems, stopMongoDaemonDelay, rsyncThreads int, lock lockfile.Lockfile) error {
+func processNodes(mongoClusterName, url string, stopBalancerTimeout int, sshUser string, sshPort, waitingChefStoppedTimeout int, mongoDataDir, dstRootPath string, retentionItems, stopMongoDaemonDelay int, rsyncThreadsFromParameter string, lock lockfile.Lockfile) error {
 	shards, err := getSecondaryNodes(url)
 	if err != nil {
 		return err
+	}
+
+	var rsyncThreads int
+	if rsyncThreadsFromParameter == "auto" {
+		rsyncThreads = len(shards)
+	} else {
+		rsyncThreads, err = strconv.Atoi(rsyncThreadsFromParameter)
+		if err != nil {
+			return fmt.Errorf("Cannot parse rsync-threads parameter: %v", err)
+		}
 	}
 
 	mongoDataDir = addTrailingSlashIfNotExists(mongoDataDir)
