@@ -25,7 +25,7 @@ import (
 )
 
 const (
-	ver string = "0.25"
+	ver string = "0.26"
 	dateLayout string = "2006-01-02_150405"
 )
 
@@ -42,6 +42,7 @@ var (
 	retentionItems = kingpin.Flag("retention-items", "number of retention items to keep").Default("5").Int()
 	verbose = kingpin.Flag("verbose", "verbose mode").Short('v').Bool()
 	rsyncThreads = kingpin.Flag("rsync-threads", "number of concurrent rsync threads, default auto refers to number of mongo shards").Default("auto").String()
+	rsyncRetries = kingpin.Flag("rsync-retries", "number of rsync retries").Default("2").Int()
 	slackURL = kingpin.Flag("slack-url", "slack URL").Default("http://127.0.0.1").String()
 	slackChannel = kingpin.Flag("slack-channel", "slack channel to send messages").Default("#it-automatic-logs").String()
 	slackUsername = kingpin.Flag("slack-username", "slack username field").Default("mongo-backup").String()
@@ -531,7 +532,20 @@ func retentionDataCleanup(rootPath string, retentionItems int) error {
 	return nil
 }
 
-func processNodes(mongoClusterName, url string, stopBalancerTimeout int, sshUser string, sshPort, waitingChefStoppedTimeout int, mongoDataDir, dstRootPath string, retentionItems, stopMongoDaemonDelay int, rsyncThreadsFromParameter string, lock lockfile.Lockfile) error {
+func processNodes(
+		mongoClusterName,
+		url string,
+		stopBalancerTimeout int,
+		sshUser string,
+		sshPort,
+		waitingChefStoppedTimeout int,
+		mongoDataDir,
+		dstRootPath string,
+		retentionItems,
+		stopMongoDaemonDelay int,
+		rsyncThreadsFromParameter string,
+		rsyncRetries int,
+		lock lockfile.Lockfile) error {
 	shards, err := getSecondaryNodes(url)
 	if err != nil {
 		return err
@@ -569,7 +583,7 @@ func processNodes(mongoClusterName, url string, stopBalancerTimeout int, sshUser
 
 	var processErr error
 	if err := drainNodes(shards, sshUser, sshPort, waitingChefStoppedTimeout, stopMongoDaemonDelay); err == nil {
-		if err := rsyncBackups(shards, mongoClusterName, sshUser, sshPort, mongoDataDir, dstRootPath, dateString, rsyncThreads); err != nil {
+		if err := rsyncBackups(shards, mongoClusterName, sshUser, sshPort, mongoDataDir, dstRootPath, dateString, rsyncThreads, rsyncRetries); err != nil {
 			log.Error(err)
 			processErr = err
 		}
@@ -594,12 +608,12 @@ func processNodes(mongoClusterName, url string, stopBalancerTimeout int, sshUser
 	return nil
 }
 
-func rsyncBackups(shards map[string]string, clusterName, sshUser string, sshPort int, srcPath, dstRootPath, dateString string, rsyncThreads int) error {
+func rsyncBackups(shards map[string]string, clusterName, sshUser string, sshPort int, srcPath, dstRootPath, dateString string, rsyncThreads, rsyncRetries int) error {
 	jobs := make(chan Job, len(shards))
 	results := make(chan Msg, len(shards))
 
 	for w := 1; w <= rsyncThreads; w++ {
-		go rsyncWorker(jobs, results)
+		go rsyncWorker(rsyncRetries, jobs, results)
 	}
 
 	for shardName, nodeName := range shards {
@@ -632,7 +646,27 @@ func rsyncBackups(shards map[string]string, clusterName, sshUser string, sshPort
 	return nil
 }
 
-func rsyncWorker(jobs <-chan Job, results chan<- Msg) {
+func rsyncExecute(rsyncRetries int, clusterName, shardName, sshUser string, sshPort int, nodeName, srcPath, dstPath string) error {
+	success := false
+	for i := 0; i < rsyncRetries; i++ {
+		log.Infof("Shard %s: performing rsync backup from %s", shardName, nodeName)
+		if err := executeCommand(prepareRsyncCommands(clusterName, shardName, sshUser, sshPort, nodeName, srcPath, dstPath)); err == nil {
+			success = true
+			break
+		} else {
+			log.Errorf("Shard %s: rsync failed from node %s: %v", shardName, nodeName, err)
+		}
+	}
+
+	if !success {
+		return fmt.Errorf("Shard %s: rsync failed from node %s", shardName, nodeName)
+	}
+
+	log.Infof("Shard %s: rsync from %s completed successfully", shardName, nodeName)
+	return nil
+}
+
+func rsyncWorker(rsyncRetries int, jobs <-chan Job, results chan<- Msg) {
 	for j := range jobs {
 		var msg Msg
 		msg.node = j.nodeName
@@ -651,16 +685,9 @@ func rsyncWorker(jobs <-chan Job, results chan<- Msg) {
 		}
 
 		if msg.err == nil {
-			log.Infof("Shard %s: performing rsync backup from %s", j.shardName, j.nodeName)
-			if err := executeCommand(prepareRsyncCommands(j.clusterName, j.shardName, j.sshUser, j.sshPort, j.nodeName, j.srcPath, dstPath)); err != nil {
+			if err := rsyncExecute(rsyncRetries, j.clusterName, j.shardName, j.sshUser, j.sshPort, j.nodeName, j.srcPath, dstPath); err != nil {
 				msg.err = err
 			}
-		}
-
-		if msg.err == nil {
-			log.Infof("Shard %s: rsync from %s completed successfully", j.shardName, j.nodeName)
-		} else {
-			log.Errorf("Shard %s: rsync failed from node %s: %v", j.shardName, msg.node, msg.err)
 		}
 
 		result := make(chan error)
@@ -811,6 +838,7 @@ func main() {
 		*retentionItems,
 		*stopMongoDaemonDelay,
 		*rsyncThreads,
+		*rsyncRetries,
 		lock,
 	); err == nil {
 		log.Info("Program finished successfully")
