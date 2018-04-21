@@ -25,8 +25,11 @@ import (
 )
 
 const (
-	ver string = "0.26"
-	dateLayout string = "2006-01-02_150405"
+	ver string = "0.44"
+	dirDateLayout string = "2006-01-02_150405"
+	logDateLayout string = "2006-01-02 15:04:05"
+	lagWaitTimeout = 1440 // in deciseconds
+	lagTolerance = 5 // in seconds
 )
 
 var (
@@ -73,7 +76,8 @@ type Job struct {
 	shardName string
 	sshUser string
 	sshPort int
-	nodeName string
+	nodeURL string
+	nodeMasterURL string
 	srcPath string
 	dstRootPath string
 	dateString string
@@ -92,6 +96,13 @@ type Attachment struct {
 	Color string `json:"color"`
 	Text string `json:"text"`
 	MrkdwnIn []string `json:"mrkdwn_in"`
+}
+
+// Shard : containts Shard data
+type Shard struct {
+	Name string
+	MasterURL string
+	SelectedSlaveURL string
 }
 
 func stopBalancer(url string, stopBalancerTimeout int) error {
@@ -169,6 +180,262 @@ func getShardMaster(url string) (string, error) {
 	return result["primary"].(string), nil
 }
 
+func getRSStatus(url string) (map[string]interface{}, error) {
+	session, err := mgo.Dial(url)
+	if err != nil {
+		return map[string]interface{}{}, err
+	}
+	defer session.Close()
+
+	result := make(map[string]interface{})
+	err = session.DB("admin").Run("replSetGetStatus", &result)
+	if err != nil {
+		return map[string]interface{}{}, err
+	}
+
+	if _, ok := result["members"]; !ok {
+		return map[string]interface{}{}, fmt.Errorf("Cannot find 'members' field in received data from %s", url)
+	}
+
+	return result, nil
+}
+
+func extractMemberDate(status map[string]interface{}, masterURL, memberURL string) (uint64, error) {
+	found := false
+	for _, member := range status["members"].([]interface{}) {
+		if member.(map[string]interface{})["name"] == memberURL {
+			found = true
+
+			if value, ok := member.(map[string]interface{})["optimeDate"]; ok {
+				return uint64(value.(time.Time).Unix()), nil
+			} else {
+				return 0, fmt.Errorf("%s: cannot find member %s field 'optimeDate' in replica set status", stripPort(masterURL), memberURL)
+			}
+		}
+	}
+
+	if !found {
+		return 0, fmt.Errorf("%s: cannot find member %s in replica set status", stripPort(masterURL), memberURL)
+	}
+
+	return 0, nil
+}
+
+func isSecondaryLagged(masterURL, memberURL string) (bool, error) {
+	status, err := getRSStatus(masterURL)
+	if err != nil {
+		return false, err
+	}
+
+	timestampMaster, err := extractMemberDate(status, masterURL, masterURL)
+	if err != nil {
+		return false, err
+	}
+
+	timestampMember, err := extractMemberDate(status, masterURL, memberURL)
+	if err != nil {
+		return false, err
+	}
+
+	if timestampMaster - timestampMember > lagTolerance {
+		log.Debugf("%s: secondary member %s lag: %d", stripPort(masterURL), memberURL, timestampMaster - timestampMember)
+		return true, nil
+	}
+
+	return false, nil
+}
+
+func waitSecondaryNotLagged(masterURL, memberURL string) error {
+	log.Infof("%s: waiting member %s is not lagged", stripPort(masterURL), stripPort(memberURL))
+	success := false
+
+	for i := 0; i < lagWaitTimeout; i++ {
+		lag, err := isSecondaryLagged(masterURL, memberURL)
+		if err != nil {
+			return err
+		}
+
+		if !lag {
+			success = true
+			break
+		}
+		time.Sleep(time.Second * 10)
+	}
+
+	if success {
+		log.Infof("%s: member %s is not lagged", stripPort(masterURL), stripPort(memberURL))
+	} else {
+		return fmt.Errorf("%s: waiting for secondary member %s not lagged timeout", stripPort(masterURL), stripPort(memberURL))
+	}
+
+	return nil
+}
+
+func getRSConfig(url string) (map[string]interface{}, error) {
+	session, err := mgo.Dial(url)
+	if err != nil {
+		return map[string]interface{}{}, err
+	}
+	defer session.Close()
+
+	result := make(map[string]interface{})
+	err = session.DB("admin").Run("replSetGetConfig", &result)
+	if err != nil {
+		return map[string]interface{}{}, err
+	}
+
+	if _, ok := result["config"]; !ok {
+		return map[string]interface{}{}, fmt.Errorf("Cannot find 'config' field in received data from %s", url)
+	}
+
+	return result, nil
+}
+
+func setRSConfig(url string, config map[string]interface{}) error {
+	session, err := mgo.Dial(url)
+	if err != nil {
+		return err
+	}
+	defer session.Close()
+
+	log.Infof("%s: applying new replica set config", stripPort(url))
+	err = session.Run(bson.D{{"replSetReconfig", config}}, nil)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func hideMembers(shards []Shard) error {
+	result := make(chan error, len(shards))
+
+	for _, shard := range shards {
+		go hideMember(shard.MasterURL, shard.SelectedSlaveURL, result)
+	}
+
+	if !allResultsSuccess(len(shards), result) {
+		return errors.New("Hidding members failed on one or more nodes")
+	}
+
+	return nil
+}
+
+func hideMember(url, targetMember string, result chan<- error) {
+	config, err := getRSConfig(url)
+	if err != nil {
+		result <- err
+		return
+	}
+
+	log.Infof("%s: creating new replica set config with hidden %s member", stripPort(url), targetMember)
+
+	success := false
+	for _, member := range config["config"].(map[string]interface{})["members"].([]interface{}) {
+		if member.(map[string]interface{})["host"] == targetMember {
+			member.(map[string]interface{})["priority"] = 0
+			member.(map[string]interface{})["hidden"] = true
+			success = true
+			break
+		}
+	}
+
+	if !success {
+		result <- fmt.Errorf("Cannot find member %s in current replica set config", targetMember)
+		return
+	}
+
+	config["config"].(map[string]interface{})["version"] = config["config"].(map[string]interface{})["version"].(int) + 1
+
+
+	if err := setRSConfig(url, config["config"].(map[string]interface{})); err != nil {
+		result <- err
+		return
+	}
+
+	result <- nil
+}
+
+func unhideMembers(shards []Shard) error {
+	result := make(chan Msg, len(shards))
+
+	for _, shard := range shards {
+		go waitAndUnhideMember(shard.MasterURL, shard.SelectedSlaveURL, result)
+	}
+
+	if !allResultsSuccessM(len(shards), result) {
+		return errors.New("Unhidding members failed on one or more nodes")
+	}
+
+	return nil
+}
+
+func unhideMember(url, targetMember string, result chan<- error) {
+	config, err := getRSConfig(url)
+	if err != nil {
+		result <- err
+		return
+	}
+
+	log.Infof("%s: creating new replica set config with unhidden %s member", stripPort(url), targetMember)
+
+	success := false
+	for _, member := range config["config"].(map[string]interface{})["members"].([]interface{}) {
+		if member.(map[string]interface{})["host"] == targetMember {
+			member.(map[string]interface{})["priority"] = 1
+			member.(map[string]interface{})["hidden"] = false
+			success = true
+			break
+		}
+	}
+
+	if !success {
+		result <- fmt.Errorf("Cannot find member %s in current replica set config", targetMember)
+		return
+	}
+
+	config["config"].(map[string]interface{})["version"] = config["config"].(map[string]interface{})["version"].(int) + 1
+
+
+	if err := setRSConfig(url, config["config"].(map[string]interface{})); err != nil {
+		result <- err
+		return
+	}
+
+	result <- nil
+}
+
+func unhideSingleMember(masterURL, node string) error {
+	result := make(chan error)
+
+	go unhideMember(masterURL, node, result)
+
+	if err := <-result; err != nil {
+		return fmt.Errorf("%s: cannot unhide member: %v", node, err)
+	}
+
+	return nil
+}
+
+func waitAndUnhideMember(masterURL, memberURL string, results chan<- Msg) {
+	var msg Msg
+	msg.node = stripPort(memberURL)
+
+	if err := waitSecondaryNotLagged(masterURL, memberURL); err != nil {
+		msg.err = err
+		results <- msg
+		return
+	}
+
+	if err := unhideSingleMember(masterURL, memberURL); err != nil {
+		msg.err = err
+		results <- msg
+		return
+	}
+
+	results <- msg
+}
+
 func dbStats(url string) (bson.M, error) {
 	session, err := mgo.Dial(url)
 	if err != nil {
@@ -189,7 +456,7 @@ func dbStats(url string) (bson.M, error) {
 	return result["raw"].(bson.M), nil
 }
 
-func getShards(url string) (map[string][]map[string]string, error) {
+func getShardsData(url string) (map[string][]map[string]string, error) {
 	shards := make(map[string][]map[string]string)
 
 	data, err := dbStats(url)
@@ -211,7 +478,7 @@ func getShards(url string) (map[string][]map[string]string, error) {
 }
 
 func markMasterShard(url string) (map[string][]map[string]string, error) {
-	shards, err := getShards(url)
+	shards, err := getShardsData(url)
 	if err != nil {
 		return map[string][]map[string]string{}, err
 	}
@@ -241,28 +508,47 @@ func markMasterShard(url string) (map[string][]map[string]string, error) {
 	}
 
 	log.Infof("Found shards: %v", markedShards)
+
 	return markedShards, nil
 }
 
-func getSecondaryNodes(url string) (map[string]string, error) {
-	shards, err := markMasterShard(url)
+func getShards(url string) ([]Shard, error) {
+	shardsData, err := markMasterShard(url)
 	if err != nil {
-		return map[string]string{}, err
+		return []Shard{}, err
 	}
 
-	secondaryNodes := make(map[string]string)
-	for shard, nodes := range shards {
+	var shards []Shard
+	for shardName, nodes := range shardsData {
+		var shard Shard
+		shard.Name = shardName
+
 		for _, node := range nodes {
-			if _, ok := node["master"]; !ok {
-				secondaryNodes[shard] = strings.Split(node["node_url"], ":")[0]
+			if _, ok := node["master"]; ok {
+				shard.MasterURL = node["node_url"]
+				break
 			}
 		}
-		if _, ok := secondaryNodes[shard]; !ok {
-			log.Warnf("No secondary node for shard %s", shard)
+
+		for _, node := range nodes {
+			if _, ok := node["master"]; !ok {
+				shard.SelectedSlaveURL = node["node_url"]
+				break
+			}
 		}
+
+		if shard.MasterURL == "" || shard.SelectedSlaveURL == "" {
+			log.Warnf("No node data for shard %s", shardName)
+		}
+		shards = append(shards, shard)
+
 	}
 
-	return secondaryNodes, nil
+	return shards, nil
+}
+
+func stripPort(url string) string {
+	return strings.Split(url, ":")[0]
 }
 
 func prepareSSHCommands(nodeName, sshUser string, sshPort int, remoteCmd []string) Command {
@@ -296,6 +582,7 @@ func disableChef(nodeName, sshUser string, sshPort, waitingChefStoppedTimeout in
 		result <- err
 		return
 	}
+
 	result <- nil
 }
 
@@ -315,6 +602,7 @@ func stopMongoDaemon(nodeName, sshUser string, sshPort int, result chan<- error)
 
 	log.Infof("%s: mongod daemon stopped", nodeName)
 	flushBuffers(nodeName, sshUser, sshPort)
+
 	result <- nil
 }
 
@@ -370,7 +658,7 @@ func waitingChefStopped(nodeName, sshUser string, port, waitingChefStoppedTimeou
 	return nil
 }
 
-func drainNodes(shards map[string]string, sshUser string, sshPort, waitingChefStoppedTimeout, stopMongoDaemonDelay int) error {
+func drainNodes(shards []Shard, sshUser string, sshPort, waitingChefStoppedTimeout, stopMongoDaemonDelay int) error {
 	failed := false
 	if err := disableChefOnNodes(shards, sshUser, sshPort, waitingChefStoppedTimeout); err != nil {
 		log.Error(err)
@@ -397,45 +685,49 @@ func drainNodes(shards map[string]string, sshUser string, sshPort, waitingChefSt
 	if failed {
 		return errors.New("Draining failed on one or more nodes")
 	}
+
 	return nil
 }
 
-func disableChefOnNodes(shards map[string]string, sshUser string, sshPort, waitingChefStoppedTimeout int) error {
+func disableChefOnNodes(shards []Shard, sshUser string, sshPort, waitingChefStoppedTimeout int) error {
 	result := make(chan error, len(shards))
 
-	for _, nodeName := range shards {
-		go disableChef(nodeName, sshUser, sshPort, waitingChefStoppedTimeout, result)
+	for _, shard := range shards {
+		go disableChef(stripPort(shard.SelectedSlaveURL), sshUser, sshPort, waitingChefStoppedTimeout, result)
 	}
 
-	if !allResultsSuccess(shards, result) {
+	if !allResultsSuccess(len(shards), result) {
 		return errors.New("Disabling chef failed on one or more nodes")
 	}
+
 	return nil
 }
 
-func disableMongoOnNodes(shards map[string]string, sshUser string, sshPort int) error {
+func disableMongoOnNodes(shards []Shard, sshUser string, sshPort int) error {
 	result := make(chan error, len(shards))
 
-	for _, nodeName := range shards {
-		go disableMongo(nodeName, sshUser, sshPort, result)
+	for _, shard := range shards {
+		go disableMongo(stripPort(shard.SelectedSlaveURL), sshUser, sshPort, result)
 	}
 
-	if !allResultsSuccess(shards, result) {
+	if !allResultsSuccess(len(shards), result) {
 		return errors.New("Disabling mongod failed on one or more nodes")
 	}
+
 	return nil
 }
 
-func stopMongoDaemonOnNodes(shards map[string]string, sshUser string, sshPort int) error {
+func stopMongoDaemonOnNodes(shards []Shard, sshUser string, sshPort int) error {
 	result := make(chan error, len(shards))
 
-	for _, nodeName := range shards {
-		go stopMongoDaemon(nodeName, sshUser, sshPort, result)
+	for _, shard := range shards {
+		go stopMongoDaemon(stripPort(shard.SelectedSlaveURL), sshUser, sshPort, result)
 	}
 
-	if !allResultsSuccess(shards, result) {
+	if !allResultsSuccess(len(shards), result) {
 		return errors.New("Stopping mongod daemon failed on one or more nodes")
 	}
+
 	return nil
 }
 
@@ -461,36 +753,52 @@ func activateNode(nodeName, sshUser string, sshPort int, result chan<- error) {
 	result <- nil
 }
 
-func activateNodes(shards map[string]string, sshUser string, sshPort int) error {
+func activateSingleNode(nodeName, sshUser string, sshPort int) {
+	result := make(chan error)
+
+	go activateNode(nodeName, sshUser, sshPort, result)
+
+	if err := <-result; err != nil {
+		log.Errorf("%s: cannot enable mongo node: %v", nodeName, err)
+	}
+}
+
+func activateNodes(shards []Shard, sshUser string, sshPort int) error {
 	result := make(chan error, len(shards))
 
-	for _, nodeName := range shards {
-		go activateNode(nodeName, sshUser, sshPort, result)
+	for _, shard := range shards {
+		go activateNode(stripPort(shard.SelectedSlaveURL), sshUser, sshPort, result)
 	}
 
-	if !allResultsSuccess(shards, result) {
+	if !allResultsSuccess(len(shards), result) {
 		return errors.New("One or more nodes activate failed")
 	}
+
 	return nil
 }
 
-func allResultsSuccess(shards map[string]string, result <-chan error) bool {
+func allResultsSuccess(numOfWorkers int, result <-chan error) bool {
 	success := true
-	for i := 0; i < len(shards); i++ {
+	for i := 0; i < numOfWorkers; i++ {
 		if err := <-result; err != nil {
 			log.Error(err)
 			success = false
 		}
 	}
+
 	return success
 }
 
-func clenaup(url string, shards map[string]string, sshUser string, sshPort int) {
+func cleanup(url string, shards []Shard, sshUser string, sshPort int) {
 	if err := activateNodes(shards, sshUser, sshPort); err != nil {
 		log.Error(err)
 	}
 
 	if err := startBalancer(url); err != nil {
+		log.Error(err)
+	}
+
+	if err := unhideMembers(shards); err != nil {
 		log.Error(err)
 	}
 }
@@ -500,6 +808,7 @@ func addTrailingSlashIfNotExists(path string) string {
 	if string(char) != "/" {
 		path = path + "/"
 	}
+
 	return path
 }
 
@@ -508,6 +817,7 @@ func deleteTrailingSlashIfExists(path string) string {
 	if string(char) == "/" {
 		path = path[:len(path)-1]
 	}
+
 	return path
 }
 
@@ -546,7 +856,7 @@ func processNodes(
 		rsyncThreadsFromParameter string,
 		rsyncRetries int,
 		lock lockfile.Lockfile) error {
-	shards, err := getSecondaryNodes(url)
+	shards, err := getShards(url)
 	if err != nil {
 		return err
 	}
@@ -563,7 +873,7 @@ func processNodes(
 
 	mongoDataDir = addTrailingSlashIfNotExists(mongoDataDir)
 	dstRootPath = deleteTrailingSlashIfExists(dstRootPath)
-	dateString := fmt.Sprint(time.Now().Format(dateLayout))
+	dateString := fmt.Sprint(time.Now().Format(dirDateLayout))
 
 	go func() {
 		sigchan := make(chan os.Signal, 1)
@@ -571,7 +881,7 @@ func processNodes(
 		<-sigchan
 		log.Error("Program killed!")
 
-		clenaup(url, shards, sshUser, sshPort)
+		cleanup(url, shards, sshUser, sshPort)
 
 		lock.Unlock()
 		os.Exit(1)
@@ -581,16 +891,26 @@ func processNodes(
 		return err
 	}
 
+	if err := hideMembers(shards); err != nil {
+		return err
+	}
+
 	var processErr error
 	if err := drainNodes(shards, sshUser, sshPort, waitingChefStoppedTimeout, stopMongoDaemonDelay); err == nil {
 		if err := rsyncBackups(shards, mongoClusterName, sshUser, sshPort, mongoDataDir, dstRootPath, dateString, rsyncThreads, rsyncRetries); err != nil {
 			log.Error(err)
 			processErr = err
 		}
+	// if draining nodes fail
 	} else {
 		log.Error(err)
 		processErr = err
+
 		if err := activateNodes(shards, sshUser, sshPort); err != nil {
+			log.Error(err)
+		}
+
+		if err := unhideMembers(shards); err != nil {
 			log.Error(err)
 		}
 	}
@@ -608,39 +928,57 @@ func processNodes(
 	return nil
 }
 
-func rsyncBackups(shards map[string]string, clusterName, sshUser string, sshPort int, srcPath, dstRootPath, dateString string, rsyncThreads, rsyncRetries int) error {
-	jobs := make(chan Job, len(shards))
-	results := make(chan Msg, len(shards))
+func allResultsSuccessM(numOfWorkers int, channel <-chan Msg) bool {
+	success := true
 
-	for w := 1; w <= rsyncThreads; w++ {
-		go rsyncWorker(rsyncRetries, jobs, results)
+	for i := 0; i < numOfWorkers; i++ {
+		msg := <-channel
+		if msg.err != nil {
+			log.Error(msg.err)
+			success = false
+		}
 	}
 
-	for shardName, nodeName := range shards {
+	return success
+}
+
+func rsyncBackups(shards []Shard, clusterName, sshUser string, sshPort int, srcPath, dstRootPath, dateString string, rsyncThreads, rsyncRetries int) error {
+	jobs := make(chan Job, len(shards))
+	results := make(chan Msg, len(shards))
+	unhideResults := make(chan Msg, len(shards))
+
+	for w := 1; w <= rsyncThreads; w++ {
+		go rsyncWorker(rsyncRetries, jobs, results, unhideResults)
+	}
+
+	for _, shard := range shards {
 		var j Job
 		j.clusterName = clusterName
 		j.sshUser = sshUser
 		j.sshPort = sshPort
 		j.srcPath = srcPath
 		j.dstRootPath = dstRootPath
-		j.shardName = shardName
-		j.nodeName = nodeName
+		j.shardName = shard.Name
+		j.nodeURL = shard.SelectedSlaveURL
+		j.nodeMasterURL = shard.MasterURL
 		j.dateString = dateString
 
 		jobs <- j
 	}
 	close(jobs)
 
-	failedNode := false
-	for i := 0; i < len(shards); i++ {
-		msg := <-results
-		if msg.err != nil {
-			failedNode = true
-		}
+	var errs []string
+
+	if !allResultsSuccessM(len(shards), results) {
+		errs = append(errs, "One or more rsync failed")
 	}
 
-	if failedNode {
-		return errors.New("One or more rsync failed")
+	if !allResultsSuccessM(len(shards), unhideResults) {
+		errs = append(errs, "Unhide one or more node failed")
+	}
+
+	if len(errs) > 0 {
+		return fmt.Errorf(strings.Join(errs, "; "))
 	}
 
 	return nil
@@ -663,13 +1001,16 @@ func rsyncExecute(rsyncRetries int, clusterName, shardName, sshUser string, sshP
 	}
 
 	log.Infof("Shard %s: rsync from %s completed successfully", shardName, nodeName)
+
 	return nil
 }
 
-func rsyncWorker(rsyncRetries int, jobs <-chan Job, results chan<- Msg) {
+func rsyncWorker(rsyncRetries int, jobs <-chan Job, results chan<- Msg, unhideResults chan<- Msg) {
 	for j := range jobs {
+		nodeName := stripPort(j.nodeURL)
+
 		var msg Msg
-		msg.node = j.nodeName
+		msg.node = nodeName
 
 		dstPath := j.dstRootPath + "/" + j.clusterName + "/" + j.dateString + "/" + j.shardName
 
@@ -685,22 +1026,20 @@ func rsyncWorker(rsyncRetries int, jobs <-chan Job, results chan<- Msg) {
 		}
 
 		if msg.err == nil {
-			if err := rsyncExecute(rsyncRetries, j.clusterName, j.shardName, j.sshUser, j.sshPort, j.nodeName, j.srcPath, dstPath); err != nil {
+			if err := rsyncExecute(rsyncRetries, j.clusterName, j.shardName, j.sshUser, j.sshPort, nodeName, j.srcPath, dstPath); err != nil {
 				msg.err = err
 			}
 		}
 
-		result := make(chan error)
-		go activateNode(j.nodeName, j.sshUser, j.sshPort, result)
-		if err := <-result; err != nil {
-			log.Errorf("%s: cannot enable mongo node: %v", j.nodeName, err)
-		}
+		activateSingleNode(nodeName, j.sshUser, j.sshPort)
+
+		go waitAndUnhideMember(j.nodeMasterURL, j.nodeURL, unhideResults)
 
 		if msg.err != nil {
 			// when one job failed take all jobs to avoid processing another
 			for f := range jobs {
 				var m Msg
-				m.node = f.nodeName
+				m.node = stripPort(f.nodeURL)
 				m.err = errors.New("Creating new job aborted")
 				results <- m
 			}
@@ -795,12 +1134,13 @@ func httpPost(url, data string, result chan<- error) {
 		result <- fmt.Errorf("HTTP response code: %s", resp.Status)
 		return
 	}
+
 	result <- nil
 }
 
 func main() {
 	customFormatter := new(log.TextFormatter)
-	customFormatter.TimestampFormat = "2006-01-02 15:04:05"
+	customFormatter.TimestampFormat = logDateLayout
 	log.SetFormatter(customFormatter)
 	customFormatter.FullTimestamp = true
 	log.SetOutput(os.Stdout)
