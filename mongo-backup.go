@@ -22,10 +22,12 @@ import (
 	"github.com/nightlyone/lockfile"
 	"github.com/parnurzeal/gorequest"
 	"encoding/json"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/push"
 )
 
 const (
-	ver string = "0.44"
+	ver string = "0.45"
 	dirDateLayout string = "2006-01-02_150405"
 	logDateLayout string = "2006-01-02 15:04:05"
 	lagWaitTimeout = 1440 // in deciseconds
@@ -50,6 +52,22 @@ var (
 	slackChannel = kingpin.Flag("slack-channel", "slack channel to send messages").Default("#it-automatic-logs").String()
 	slackUsername = kingpin.Flag("slack-username", "slack username field").Default("mongo-backup").String()
 	slackIconEmoji = kingpin.Flag("slack-icon-emoji", "slack icon-emoji field").Default(":mongo-backup:").String()
+	pushgatewayURL = kingpin.Flag("pushgateway-url", "pushgateway URL").Default("").String()
+)
+
+var (
+	batchJobSuccessTime = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "batchjob_last_success_timestamp_seconds",
+		Help: "The timestamp of the last successful completion of a batch job.",
+	})
+	batchJobSuccess = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "batchjob_last_success",
+		Help: "Success of the last batch job.",
+	})
+	batchJobDuration = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "batchjob_duration_seconds",
+		Help: "The duration of the last batch job in seconds.",
+	})
 )
 
 // Command : containts exec command data
@@ -1138,6 +1156,39 @@ func httpPost(url, data string, result chan<- error) {
 	result <- nil
 }
 
+func getInstance() (string, string) {
+	var k, v string
+	for k, v = range push.HostnameGroupingKey() {}
+	return k, v
+}
+
+func pushgatewayInitialize(pushgatewayURL string, start time.Time, pusher *push.Pusher, jobName string) {
+	if pushgatewayURL != "" {
+		registry := prometheus.NewRegistry()
+		registry.MustRegister(batchJobSuccessTime, batchJobSuccess, batchJobDuration)
+		pusher = push.New(pushgatewayURL, jobName).Grouping(getInstance()).Gatherer(registry)
+
+		start = time.Now()
+	}
+}
+
+func sendPushgatewayMetrics(success bool, pushgatewayURL string, start time.Time, pusher *push.Pusher) {
+	if pushgatewayURL != "" {
+		if success {
+			batchJobDuration.Set(time.Since(start).Seconds())
+			batchJobSuccessTime.SetToCurrentTime()
+			batchJobSuccess.Set(1)
+		} else {
+			batchJobSuccess.Set(0)
+		}
+
+		log.Infof("Sending metrics to pushgateway: %s", pushgatewayURL)
+		if err := pusher.Add(); err != nil {
+			log.Errorf("Could not send to pushgateway: %v", err)
+		}
+	}
+}
+
 func main() {
 	customFormatter := new(log.TextFormatter)
 	customFormatter.TimestampFormat = logDateLayout
@@ -1166,6 +1217,10 @@ func main() {
 	}
 	defer lock.Unlock()
 
+	start := time.Time{}
+	pusher := &push.Pusher{}
+	pushgatewayInitialize(*pushgatewayURL, start, pusher, "mongo-backup")
+
 	if err := processNodes(
 		*mongoClusterName,
 		*mongosURL,
@@ -1181,9 +1236,11 @@ func main() {
 		*rsyncRetries,
 		lock,
 	); err == nil {
+		sendPushgatewayMetrics(true, *pushgatewayURL, start, pusher)
 		log.Info("Program finished successfully")
 	} else {
-		log.Errorf("Program finished with error: %v", err)
+		sendPushgatewayMetrics(false, *pushgatewayURL, start, pusher)
 		sendSlackMsg(*slackURL, *slackChannel, *mongoClusterName, *slackUsername, "danger", *slackIconEmoji, 5)
+		log.Errorf("Program finished with error: %v", err)
 	}
 }
