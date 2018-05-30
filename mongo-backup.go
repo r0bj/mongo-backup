@@ -1162,14 +1162,16 @@ func getInstance() (string, string) {
 	return k, v
 }
 
-func pushgatewayInitialize(pushgatewayURL string, start time.Time, pusher *push.Pusher, jobName string) {
+func pushgatewayInitialize(pushgatewayURL string, jobName string) (*push.Pusher, time.Time) {
 	if pushgatewayURL != "" {
 		registry := prometheus.NewRegistry()
 		registry.MustRegister(batchJobSuccessTime, batchJobSuccess, batchJobDuration)
-		pusher = push.New(pushgatewayURL, jobName).Grouping(getInstance()).Gatherer(registry)
+		pusher := push.New(pushgatewayURL, jobName).Grouping(getInstance()).Gatherer(registry)
 
-		start = time.Now()
+		return pusher, time.Now()
 	}
+
+	return &push.Pusher{}, time.Time{}
 }
 
 func sendPushgatewayMetrics(success bool, pushgatewayURL string, start time.Time, pusher *push.Pusher) {
@@ -1217,9 +1219,7 @@ func main() {
 	}
 	defer lock.Unlock()
 
-	start := time.Time{}
-	pusher := &push.Pusher{}
-	pushgatewayInitialize(*pushgatewayURL, start, pusher, "mongo-backup")
+	pusher, start := pushgatewayInitialize(*pushgatewayURL, "mongo-backup")
 
 	if err := processNodes(
 		*mongoClusterName,
