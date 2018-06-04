@@ -27,7 +27,7 @@ import (
 )
 
 const (
-	ver string = "0.45"
+	ver string = "0.46"
 	dirDateLayout string = "2006-01-02_150405"
 	logDateLayout string = "2006-01-02 15:04:05"
 	lagWaitTimeout = 1440 // in deciseconds
@@ -1162,11 +1162,11 @@ func getInstance() (string, string) {
 	return k, v
 }
 
-func pushgatewayInitialize(pushgatewayURL string, jobName string) (*push.Pusher, time.Time) {
+func pushgatewayInitialize(pushgatewayURL, jobName, clusterName string) (*push.Pusher, time.Time) {
 	if pushgatewayURL != "" {
 		registry := prometheus.NewRegistry()
 		registry.MustRegister(batchJobSuccessTime, batchJobSuccess, batchJobDuration)
-		pusher := push.New(pushgatewayURL, jobName).Grouping(getInstance()).Gatherer(registry)
+		pusher := push.New(pushgatewayURL, jobName).Grouping(getInstance()).Grouping("cluster_name", clusterName).Gatherer(registry)
 
 		return pusher, time.Now()
 	}
@@ -1219,7 +1219,7 @@ func main() {
 	}
 	defer lock.Unlock()
 
-	pusher, start := pushgatewayInitialize(*pushgatewayURL, "mongo-backup")
+	pusher, start := pushgatewayInitialize(*pushgatewayURL, "mongo-backup", *mongoClusterName)
 
 	if err := processNodes(
 		*mongoClusterName,
