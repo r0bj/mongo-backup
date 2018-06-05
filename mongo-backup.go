@@ -27,7 +27,7 @@ import (
 )
 
 const (
-	ver string = "0.46"
+	ver string = "0.47"
 	dirDateLayout string = "2006-01-02_150405"
 	logDateLayout string = "2006-01-02 15:04:05"
 	lagWaitTimeout = 1440 // in deciseconds
@@ -56,17 +56,17 @@ var (
 )
 
 var (
-	batchJobSuccessTime = prometheus.NewGauge(prometheus.GaugeOpts{
-		Name: "batchjob_last_success_timestamp_seconds",
-		Help: "The timestamp of the last successful completion of a batch job.",
+	MongoBackupSuccessTime = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "mongo_backup_last_success_timestamp_seconds",
+		Help: "The timestamp of the last successful completion of a mongo backup.",
 	})
-	batchJobSuccess = prometheus.NewGauge(prometheus.GaugeOpts{
-		Name: "batchjob_last_success",
-		Help: "Success of the last batch job.",
+	MongoBackupSuccess = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "mongo_backup_last_success",
+		Help: "Success of the last mongo backup.",
 	})
-	batchJobDuration = prometheus.NewGauge(prometheus.GaugeOpts{
-		Name: "batchjob_duration_seconds",
-		Help: "The duration of the last batch job in seconds.",
+	MongoBackupDuration = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "mongo_backup_duration_seconds",
+		Help: "The duration of the last mongo backup in seconds.",
 	})
 )
 
@@ -1165,7 +1165,7 @@ func getInstance() (string, string) {
 func pushgatewayInitialize(pushgatewayURL, jobName, clusterName string) (*push.Pusher, time.Time) {
 	if pushgatewayURL != "" {
 		registry := prometheus.NewRegistry()
-		registry.MustRegister(batchJobSuccessTime, batchJobSuccess, batchJobDuration)
+		registry.MustRegister(MongoBackupSuccessTime, MongoBackupSuccess, MongoBackupDuration)
 		pusher := push.New(pushgatewayURL, jobName).Grouping(getInstance()).Grouping("cluster_name", clusterName).Gatherer(registry)
 
 		return pusher, time.Now()
@@ -1177,11 +1177,11 @@ func pushgatewayInitialize(pushgatewayURL, jobName, clusterName string) (*push.P
 func sendPushgatewayMetrics(success bool, pushgatewayURL string, start time.Time, pusher *push.Pusher) {
 	if pushgatewayURL != "" {
 		if success {
-			batchJobDuration.Set(time.Since(start).Seconds())
-			batchJobSuccessTime.SetToCurrentTime()
-			batchJobSuccess.Set(1)
+			MongoBackupDuration.Set(time.Since(start).Seconds())
+			MongoBackupSuccessTime.SetToCurrentTime()
+			MongoBackupSuccess.Set(1)
 		} else {
-			batchJobSuccess.Set(0)
+			MongoBackupSuccess.Set(0)
 		}
 
 		log.Infof("Sending metrics to pushgateway: %s", pushgatewayURL)
