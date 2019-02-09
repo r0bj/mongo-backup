@@ -27,11 +27,13 @@ import (
 )
 
 const (
-	ver string = "0.47"
+	ver string = "0.48"
 	dirDateLayout string = "2006-01-02_150405"
 	logDateLayout string = "2006-01-02 15:04:05"
 	lagWaitTimeout = 1440 // in deciseconds
 	lagTolerance = 5 // in seconds
+	defaultAlertmanagerSilenceDuration string = "12h"
+	defaultAlertmanagerSilenceComment string = "mongo-backup"
 )
 
 var (
@@ -53,6 +55,8 @@ var (
 	slackUsername = kingpin.Flag("slack-username", "slack username field").Default("mongo-backup").String()
 	slackIconEmoji = kingpin.Flag("slack-icon-emoji", "slack icon-emoji field").Default(":mongo-backup:").String()
 	pushgatewayURL = kingpin.Flag("pushgateway-url", "pushgateway URL").Default("").String()
+	amtoolPath = kingpin.Flag("amtool", "path to amtool binary").Default("/usr/bin/amtool").String()
+	alertmanagerURL = kingpin.Flag("alertmanager-url", "alertmanager URL").Default("").String()
 )
 
 var (
@@ -676,11 +680,89 @@ func waitingChefStopped(nodeName, sshUser string, port, waitingChefStoppedTimeou
 	return nil
 }
 
-func drainNodes(shards []Shard, sshUser string, sshPort, waitingChefStoppedTimeout, stopMongoDaemonDelay int) error {
+func silenceAlertmanagerAlert(instance, amtoolPath, alertmanagerURL string) error {
+	instanceShort := strings.Split(instance, ".")[0]
+
+	var command Command
+	command.cmd = amtoolPath
+	command.args = []string{
+		"--alertmanager.url=" + alertmanagerURL,
+		"silence",
+		"add",
+		"-c",
+		defaultAlertmanagerSilenceComment,
+		"-d",
+		defaultAlertmanagerSilenceDuration,
+		"instance=" + instanceShort,
+	}
+	if err := executeCommand(command); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func removeAlertmanagerSilence(instance, amtoolPath, alertmanagerURL string) error {
+	instanceShort := strings.Split(instance, ".")[0]
+
+	var command Command
+	command.cmd = "/bin/sh"
+	command.args = []string{
+		"-c",
+		amtoolPath + " --alertmanager.url=" + alertmanagerURL + " silence expire $(" + amtoolPath + " --alertmanager.url=" + alertmanagerURL + " silence query -q instance=" + instanceShort + ")",
+	}
+	if err := executeCommand(command); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func silenceAlertmanagerAlerts(shards []Shard, amtoolPath, alertmanagerURL string) error {
+	var errors []string
+	if alertmanagerURL != "" {
+		for _, shard := range shards {
+			if err := silenceAlertmanagerAlert(stripPort(shard.SelectedSlaveURL), amtoolPath, alertmanagerURL); err != nil {
+				errors = append(errors, fmt.Sprintf("%s", err))
+			}
+		}
+	}
+
+	if len(errors) > 0 {
+		return fmt.Errorf("%s", strings.Join(errors, "; "))
+	}
+
+	return nil
+}
+
+func removeAlertmanagerSilences(shards []Shard, amtoolPath, alertmanagerURL string) error {
+	var errors []string
+	if alertmanagerURL != "" {
+		for _, shard := range shards {
+			if err := removeAlertmanagerSilence(stripPort(shard.SelectedSlaveURL), amtoolPath, alertmanagerURL); err != nil {
+				errors = append(errors, fmt.Sprintf("%s", err))
+			}
+		}
+	}
+
+	if len(errors) > 0 {
+		return fmt.Errorf("%s", strings.Join(errors, "; "))
+	}
+
+	return nil
+}
+
+func drainNodes(shards []Shard, sshUser string, sshPort, waitingChefStoppedTimeout, stopMongoDaemonDelay int, amtoolPath, alertmanagerURL string) error {
 	failed := false
 	if err := disableChefOnNodes(shards, sshUser, sshPort, waitingChefStoppedTimeout); err != nil {
 		log.Error(err)
 		failed = true
+	}
+
+	if !failed {
+		if err := silenceAlertmanagerAlerts(shards, amtoolPath, alertmanagerURL); err != nil {
+			log.Error(err)
+		}
 	}
 
 	if !failed {
@@ -807,7 +889,7 @@ func allResultsSuccess(numOfWorkers int, result <-chan error) bool {
 	return success
 }
 
-func cleanup(url string, shards []Shard, sshUser string, sshPort int) {
+func cleanup(url string, shards []Shard, sshUser string, sshPort int, amtoolPath, alertmanagerURL string) {
 	if err := activateNodes(shards, sshUser, sshPort); err != nil {
 		log.Error(err)
 	}
@@ -817,6 +899,10 @@ func cleanup(url string, shards []Shard, sshUser string, sshPort int) {
 	}
 
 	if err := unhideMembers(shards); err != nil {
+		log.Error(err)
+	}
+
+	if err := removeAlertmanagerSilences(shards, amtoolPath, alertmanagerURL); err != nil {
 		log.Error(err)
 	}
 }
@@ -873,6 +959,8 @@ func processNodes(
 		stopMongoDaemonDelay int,
 		rsyncThreadsFromParameter string,
 		rsyncRetries int,
+		amtoolPath string,
+		alertmanagerURL string,
 		lock lockfile.Lockfile) error {
 	shards, err := getShards(url)
 	if err != nil {
@@ -899,7 +987,7 @@ func processNodes(
 		<-sigchan
 		log.Error("Program killed!")
 
-		cleanup(url, shards, sshUser, sshPort)
+		cleanup(url, shards, sshUser, sshPort, amtoolPath, alertmanagerURL)
 
 		lock.Unlock()
 		os.Exit(1)
@@ -914,7 +1002,7 @@ func processNodes(
 	}
 
 	var processErr error
-	if err := drainNodes(shards, sshUser, sshPort, waitingChefStoppedTimeout, stopMongoDaemonDelay); err == nil {
+	if err := drainNodes(shards, sshUser, sshPort, waitingChefStoppedTimeout, stopMongoDaemonDelay, amtoolPath, alertmanagerURL); err == nil {
 		if err := rsyncBackups(shards, mongoClusterName, sshUser, sshPort, mongoDataDir, dstRootPath, dateString, rsyncThreads, rsyncRetries); err != nil {
 			log.Error(err)
 			processErr = err
@@ -935,6 +1023,10 @@ func processNodes(
 
 	if err := startBalancer(url); err != nil {
 		return err
+	}
+
+	if err := removeAlertmanagerSilences(shards, amtoolPath, alertmanagerURL); err != nil {
+		log.Error(err)
 	}
 
 	if processErr == nil {
@@ -1234,6 +1326,8 @@ func main() {
 		*stopMongoDaemonDelay,
 		*rsyncThreads,
 		*rsyncRetries,
+		*amtoolPath,
+		*alertmanagerURL,
 		lock,
 	); err == nil {
 		sendPushgatewayMetrics(true, *pushgatewayURL, start, pusher)
