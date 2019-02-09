@@ -719,6 +719,10 @@ func removeAlertmanagerSilence(instance, amtoolPath, alertmanagerURL string) err
 }
 
 func silenceAlertmanagerAlerts(shards []Shard, amtoolPath, alertmanagerURL string) error {
+	if _, err := os.Stat(amtoolPath); os.IsNotExist(err) {
+		return fmt.Errorf("Path %s does not exist", amtoolPath)
+	}
+
 	var errors []string
 	if alertmanagerURL != "" {
 		for _, shard := range shards {
@@ -736,6 +740,10 @@ func silenceAlertmanagerAlerts(shards []Shard, amtoolPath, alertmanagerURL strin
 }
 
 func removeAlertmanagerSilences(shards []Shard, amtoolPath, alertmanagerURL string) error {
+	if _, err := os.Stat(amtoolPath); os.IsNotExist(err) {
+		return fmt.Errorf("Path %s does not exist", amtoolPath)
+	}
+
 	var errors []string
 	if alertmanagerURL != "" {
 		for _, shard := range shards {
