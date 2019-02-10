@@ -60,14 +60,17 @@ var (
 )
 
 var (
+	// MongoBackupSuccessTime : The timestamp of the last successful completion of a mongo backup
 	MongoBackupSuccessTime = prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "mongo_backup_last_success_timestamp_seconds",
 		Help: "The timestamp of the last successful completion of a mongo backup.",
 	})
+	// MongoBackupSuccess : Success of the last mongo backup
 	MongoBackupSuccess = prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "mongo_backup_last_success",
 		Help: "Success of the last mongo backup.",
 	})
+	// MongoBackupDuration : The duration of the last mongo backup in seconds
 	MongoBackupDuration = prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "mongo_backup_duration_seconds",
 		Help: "The duration of the last mongo backup in seconds.",
@@ -230,9 +233,9 @@ func extractMemberDate(status map[string]interface{}, masterURL, memberURL strin
 
 			if value, ok := member.(map[string]interface{})["optimeDate"]; ok {
 				return uint64(value.(time.Time).Unix()), nil
-			} else {
-				return 0, fmt.Errorf("%s: cannot find member %s field 'optimeDate' in replica set status", stripPort(masterURL), memberURL)
 			}
+
+			return 0, fmt.Errorf("%s: cannot find member %s field 'optimeDate' in replica set status", stripPort(masterURL), memberURL)
 		}
 	}
 
@@ -695,11 +698,9 @@ func silenceAlertmanagerAlert(instance, amtoolPath, alertmanagerURL string) erro
 		defaultAlertmanagerSilenceDuration,
 		"instance=" + instanceShort,
 	}
-	if err := executeCommand(command); err != nil {
-		return err
-	}
+	err := executeCommand(command)
 
-	return nil
+	return err
 }
 
 func removeAlertmanagerSilence(instance, amtoolPath, alertmanagerURL string) error {
@@ -711,11 +712,9 @@ func removeAlertmanagerSilence(instance, amtoolPath, alertmanagerURL string) err
 		"-c",
 		amtoolPath + " --alertmanager.url=" + alertmanagerURL + " silence expire $(" + amtoolPath + " --alertmanager.url=" + alertmanagerURL + " silence query -q instance=" + instanceShort + ")",
 	}
-	if err := executeCommand(command); err != nil {
-		return err
-	}
+	err := executeCommand(command)
 
-	return nil
+	return err
 }
 
 func silenceAlertmanagerAlerts(shards []Shard, amtoolPath, alertmanagerURL string) error {
