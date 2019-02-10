@@ -27,7 +27,7 @@ import (
 )
 
 const (
-	ver string = "0.48"
+	ver string = "0.49"
 	dirDateLayout string = "2006-01-02_150405"
 	logDateLayout string = "2006-01-02 15:04:05"
 	lagWaitTimeout = 1440 // in deciseconds
@@ -684,6 +684,8 @@ func waitingChefStopped(nodeName, sshUser string, port, waitingChefStoppedTimeou
 }
 
 func silenceAlertmanagerAlert(instance, amtoolPath, alertmanagerURL string) error {
+	log.Infof("%s: setting alertmanager silence for node", instance)
+
 	instanceShort := strings.Split(instance, ".")[0]
 
 	var command Command
@@ -704,6 +706,8 @@ func silenceAlertmanagerAlert(instance, amtoolPath, alertmanagerURL string) erro
 }
 
 func removeAlertmanagerSilence(instance, amtoolPath, alertmanagerURL string) error {
+	log.Infof("%s: removing alertmanager silence for node", instance)
+
 	instanceShort := strings.Split(instance, ".")[0]
 
 	var command Command
