@@ -27,12 +27,11 @@ import (
 )
 
 const (
-	ver string = "0.49"
+	ver string = "0.50"
 	dirDateLayout string = "2006-01-02_150405"
 	logDateLayout string = "2006-01-02 15:04:05"
 	lagWaitTimeout = 1440 // in deciseconds
 	lagTolerance = 5 // in seconds
-	defaultAlertmanagerSilenceDuration string = "12h"
 	defaultAlertmanagerSilenceComment string = "mongo-backup"
 )
 
@@ -57,6 +56,7 @@ var (
 	pushgatewayURL = kingpin.Flag("pushgateway-url", "pushgateway URL").Default("").String()
 	amtoolPath = kingpin.Flag("amtool", "path to amtool binary").Default("/usr/bin/amtool").String()
 	alertmanagerURL = kingpin.Flag("alertmanager-url", "alertmanager URL").Default("").String()
+	alertmanagerSilenceDuration = kingpin.Flag("alertmanager-silence-duration", "alertmanager silence duration").Default("48h").String()
 )
 
 var (
@@ -683,7 +683,7 @@ func waitingChefStopped(nodeName, sshUser string, port, waitingChefStoppedTimeou
 	return nil
 }
 
-func silenceAlertmanagerAlert(instance, amtoolPath, alertmanagerURL string) error {
+func silenceAlertmanagerAlert(instance, amtoolPath, alertmanagerURL, alertmanagerSilenceDuration string) error {
 	log.Infof("%s: setting alertmanager silence for node", instance)
 
 	instanceShort := strings.Split(instance, ".")[0]
@@ -697,7 +697,7 @@ func silenceAlertmanagerAlert(instance, amtoolPath, alertmanagerURL string) erro
 		"-c",
 		defaultAlertmanagerSilenceComment,
 		"-d",
-		defaultAlertmanagerSilenceDuration,
+		alertmanagerSilenceDuration,
 		"instance=" + instanceShort,
 	}
 	err := executeCommand(command)
@@ -721,7 +721,7 @@ func removeAlertmanagerSilence(instance, amtoolPath, alertmanagerURL string) err
 	return err
 }
 
-func silenceAlertmanagerAlerts(shards []Shard, amtoolPath, alertmanagerURL string) error {
+func silenceAlertmanagerAlerts(shards []Shard, amtoolPath, alertmanagerURL, alertmanagerSilenceDuration string) error {
 	if _, err := os.Stat(amtoolPath); os.IsNotExist(err) {
 		return fmt.Errorf("Path %s does not exist", amtoolPath)
 	}
@@ -729,7 +729,7 @@ func silenceAlertmanagerAlerts(shards []Shard, amtoolPath, alertmanagerURL strin
 	var errors []string
 	if alertmanagerURL != "" {
 		for _, shard := range shards {
-			if err := silenceAlertmanagerAlert(stripPort(shard.SelectedSlaveURL), amtoolPath, alertmanagerURL); err != nil {
+			if err := silenceAlertmanagerAlert(stripPort(shard.SelectedSlaveURL), amtoolPath, alertmanagerURL, alertmanagerSilenceDuration); err != nil {
 				errors = append(errors, fmt.Sprintf("%s", err))
 			}
 		}
@@ -763,7 +763,7 @@ func removeAlertmanagerSilences(shards []Shard, amtoolPath, alertmanagerURL stri
 	return nil
 }
 
-func drainNodes(shards []Shard, sshUser string, sshPort, waitingChefStoppedTimeout, stopMongoDaemonDelay int, amtoolPath, alertmanagerURL string) error {
+func drainNodes(shards []Shard, sshUser string, sshPort, waitingChefStoppedTimeout, stopMongoDaemonDelay int, amtoolPath, alertmanagerURL, alertmanagerSilenceDuration string) error {
 	failed := false
 	if err := disableChefOnNodes(shards, sshUser, sshPort, waitingChefStoppedTimeout); err != nil {
 		log.Error(err)
@@ -771,7 +771,7 @@ func drainNodes(shards []Shard, sshUser string, sshPort, waitingChefStoppedTimeo
 	}
 
 	if !failed {
-		if err := silenceAlertmanagerAlerts(shards, amtoolPath, alertmanagerURL); err != nil {
+		if err := silenceAlertmanagerAlerts(shards, amtoolPath, alertmanagerURL, alertmanagerSilenceDuration); err != nil {
 			log.Error(err)
 		}
 	}
@@ -972,6 +972,7 @@ func processNodes(
 		rsyncRetries int,
 		amtoolPath string,
 		alertmanagerURL string,
+		alertmanagerSilenceDuration string,
 		lock lockfile.Lockfile) error {
 	shards, err := getShards(url)
 	if err != nil {
@@ -1013,7 +1014,7 @@ func processNodes(
 	}
 
 	var processErr error
-	if err := drainNodes(shards, sshUser, sshPort, waitingChefStoppedTimeout, stopMongoDaemonDelay, amtoolPath, alertmanagerURL); err == nil {
+	if err := drainNodes(shards, sshUser, sshPort, waitingChefStoppedTimeout, stopMongoDaemonDelay, amtoolPath, alertmanagerURL, alertmanagerSilenceDuration); err == nil {
 		if err := rsyncBackups(shards, mongoClusterName, sshUser, sshPort, mongoDataDir, dstRootPath, dateString, rsyncThreads, rsyncRetries); err != nil {
 			log.Error(err)
 			processErr = err
@@ -1339,6 +1340,7 @@ func main() {
 		*rsyncRetries,
 		*amtoolPath,
 		*alertmanagerURL,
+		*alertmanagerSilenceDuration,
 		lock,
 	); err == nil {
 		sendPushgatewayMetrics(true, *pushgatewayURL, start, pusher)
