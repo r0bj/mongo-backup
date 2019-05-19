@@ -27,10 +27,9 @@ import (
 )
 
 const (
-	ver string = "0.50"
+	ver string = "0.51"
 	dirDateLayout string = "2006-01-02_150405"
 	logDateLayout string = "2006-01-02 15:04:05"
-	lagWaitTimeout = 1440 // in deciseconds
 	lagTolerance = 5 // in seconds
 	defaultAlertmanagerSilenceComment string = "mongo-backup"
 )
@@ -57,6 +56,7 @@ var (
 	amtoolPath = kingpin.Flag("amtool", "path to amtool binary").Default("/usr/bin/amtool").String()
 	alertmanagerURL = kingpin.Flag("alertmanager-url", "alertmanager URL").Default("").String()
 	alertmanagerSilenceDuration = kingpin.Flag("alertmanager-silence-duration", "alertmanager silence duration").Default("48h").String()
+	lagWaitTimeout = kingpin.Flag("lag-wait-timeout", "Replica lag wait timeout is seconds").Default("36000").Int()
 )
 
 var (
@@ -270,11 +270,11 @@ func isSecondaryLagged(masterURL, memberURL string) (bool, error) {
 	return false, nil
 }
 
-func waitSecondaryNotLagged(masterURL, memberURL string) error {
+func waitSecondaryNotLagged(masterURL, memberURL string, lagWaitTimeout int) error {
 	log.Infof("%s: waiting member %s is not lagged", stripPort(masterURL), stripPort(memberURL))
 	success := false
 
-	for i := 0; i < lagWaitTimeout; i++ {
+	for i := 0; i < lagWaitTimeout / 10; i++ {
 		lag, err := isSecondaryLagged(masterURL, memberURL)
 		if err != nil {
 			return err
@@ -381,11 +381,11 @@ func hideMember(url, targetMember string, result chan<- error) {
 	result <- nil
 }
 
-func unhideMembers(shards []Shard) error {
+func unhideMembers(shards []Shard, lagWaitTimeout int) error {
 	result := make(chan Msg, len(shards))
 
 	for _, shard := range shards {
-		go waitAndUnhideMember(shard.MasterURL, shard.SelectedSlaveURL, result)
+		go waitAndUnhideMember(shard.MasterURL, shard.SelectedSlaveURL, result, lagWaitTimeout)
 	}
 
 	if !allResultsSuccessM(len(shards), result) {
@@ -442,11 +442,11 @@ func unhideSingleMember(masterURL, node string) error {
 	return nil
 }
 
-func waitAndUnhideMember(masterURL, memberURL string, results chan<- Msg) {
+func waitAndUnhideMember(masterURL, memberURL string, results chan<- Msg, lagWaitTimeout int) {
 	var msg Msg
 	msg.node = stripPort(memberURL)
 
-	if err := waitSecondaryNotLagged(masterURL, memberURL); err != nil {
+	if err := waitSecondaryNotLagged(masterURL, memberURL, lagWaitTimeout); err != nil {
 		msg.err = err
 		results <- msg
 		return
@@ -900,7 +900,7 @@ func allResultsSuccess(numOfWorkers int, result <-chan error) bool {
 	return success
 }
 
-func cleanup(url string, shards []Shard, sshUser string, sshPort int, amtoolPath, alertmanagerURL string) {
+func cleanup(url string, shards []Shard, sshUser string, sshPort int, amtoolPath, alertmanagerURL string, lagWaitTimeout int) {
 	if err := activateNodes(shards, sshUser, sshPort); err != nil {
 		log.Error(err)
 	}
@@ -909,7 +909,7 @@ func cleanup(url string, shards []Shard, sshUser string, sshPort int, amtoolPath
 		log.Error(err)
 	}
 
-	if err := unhideMembers(shards); err != nil {
+	if err := unhideMembers(shards, lagWaitTimeout); err != nil {
 		log.Error(err)
 	}
 
@@ -973,6 +973,7 @@ func processNodes(
 		amtoolPath string,
 		alertmanagerURL string,
 		alertmanagerSilenceDuration string,
+		lagWaitTimeout int,
 		lock lockfile.Lockfile) error {
 	shards, err := getShards(url)
 	if err != nil {
@@ -999,7 +1000,7 @@ func processNodes(
 		<-sigchan
 		log.Error("Program killed!")
 
-		cleanup(url, shards, sshUser, sshPort, amtoolPath, alertmanagerURL)
+		cleanup(url, shards, sshUser, sshPort, amtoolPath, alertmanagerURL, lagWaitTimeout)
 
 		lock.Unlock()
 		os.Exit(1)
@@ -1015,7 +1016,7 @@ func processNodes(
 
 	var processErr error
 	if err := drainNodes(shards, sshUser, sshPort, waitingChefStoppedTimeout, stopMongoDaemonDelay, amtoolPath, alertmanagerURL, alertmanagerSilenceDuration); err == nil {
-		if err := rsyncBackups(shards, mongoClusterName, sshUser, sshPort, mongoDataDir, dstRootPath, dateString, rsyncThreads, rsyncRetries); err != nil {
+		if err := rsyncBackups(shards, mongoClusterName, sshUser, sshPort, mongoDataDir, dstRootPath, dateString, rsyncThreads, rsyncRetries, lagWaitTimeout); err != nil {
 			log.Error(err)
 			processErr = err
 		}
@@ -1028,7 +1029,7 @@ func processNodes(
 			log.Error(err)
 		}
 
-		if err := unhideMembers(shards); err != nil {
+		if err := unhideMembers(shards, lagWaitTimeout); err != nil {
 			log.Error(err)
 		}
 	}
@@ -1064,13 +1065,13 @@ func allResultsSuccessM(numOfWorkers int, channel <-chan Msg) bool {
 	return success
 }
 
-func rsyncBackups(shards []Shard, clusterName, sshUser string, sshPort int, srcPath, dstRootPath, dateString string, rsyncThreads, rsyncRetries int) error {
+func rsyncBackups(shards []Shard, clusterName, sshUser string, sshPort int, srcPath, dstRootPath, dateString string, rsyncThreads, rsyncRetries, lagWaitTimeout int) error {
 	jobs := make(chan Job, len(shards))
 	results := make(chan Msg, len(shards))
 	unhideResults := make(chan Msg, len(shards))
 
 	for w := 1; w <= rsyncThreads; w++ {
-		go rsyncWorker(rsyncRetries, jobs, results, unhideResults)
+		go rsyncWorker(rsyncRetries, jobs, results, unhideResults, lagWaitTimeout)
 	}
 
 	for _, shard := range shards {
@@ -1127,7 +1128,7 @@ func rsyncExecute(rsyncRetries int, clusterName, shardName, sshUser string, sshP
 	return nil
 }
 
-func rsyncWorker(rsyncRetries int, jobs <-chan Job, results chan<- Msg, unhideResults chan<- Msg) {
+func rsyncWorker(rsyncRetries int, jobs <-chan Job, results chan<- Msg, unhideResults chan<- Msg, lagWaitTimeout int) {
 	for j := range jobs {
 		nodeName := stripPort(j.nodeURL)
 
@@ -1155,7 +1156,7 @@ func rsyncWorker(rsyncRetries int, jobs <-chan Job, results chan<- Msg, unhideRe
 
 		activateSingleNode(nodeName, j.sshUser, j.sshPort)
 
-		go waitAndUnhideMember(j.nodeMasterURL, j.nodeURL, unhideResults)
+		go waitAndUnhideMember(j.nodeMasterURL, j.nodeURL, unhideResults, lagWaitTimeout)
 
 		if msg.err != nil {
 			// when one job failed take all jobs to avoid processing another
@@ -1341,6 +1342,7 @@ func main() {
 		*amtoolPath,
 		*alertmanagerURL,
 		*alertmanagerSilenceDuration,
+		*lagWaitTimeout,
 		lock,
 	); err == nil {
 		sendPushgatewayMetrics(true, *pushgatewayURL, start, pusher)
