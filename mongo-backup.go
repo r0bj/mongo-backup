@@ -27,7 +27,7 @@ import (
 )
 
 const (
-	ver string = "0.51"
+	ver string = "0.52"
 	dirDateLayout string = "2006-01-02_150405"
 	logDateLayout string = "2006-01-02 15:04:05"
 	lagTolerance = 5 // in seconds
@@ -1261,9 +1261,17 @@ func httpPost(url, data string, result chan<- error) {
 	result <- nil
 }
 
+func hostnameGroupingKey() map[string]string {
+	hostname, err := os.Hostname()
+	if err != nil {
+		return map[string]string{"instance": "unknown"}
+	}
+	return map[string]string{"instance": hostname}
+}
+
 func getInstance() (string, string) {
 	var k, v string
-	for k, v = range push.HostnameGroupingKey() {}
+	for k, v = range hostnameGroupingKey() {}
 	return k, v
 }
 
